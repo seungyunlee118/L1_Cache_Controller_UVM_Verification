@@ -11,9 +11,6 @@ FSM coverage merged across the regression.
 
 Simulator: **Vivado xsim 2025.2** (built-in UVM 1.2).
 
-> 📐 구조 다이어그램: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-> 🎯 면접 대비 정리: [docs/INTERVIEW_PREP.md](docs/INTERVIEW_PREP.md)
-
 ```
 regress.bat  ->  44/44 pass  (11 tests x 4 seeds)
                  UVM_ERROR 0, UVM_FATAL 0, SVA failures 0
@@ -24,6 +21,8 @@ regress.bat  ->  44/44 pass  (11 tests x 4 seeds)
 ---
 
 ## 1. Architecture
+
+<img width="893" height="527" alt="Image" src="https://github.com/user-attachments/assets/605ab956-8489-4566-8bd6-9132d8ddcdcb" />
 
 ```
         S1                                S2
