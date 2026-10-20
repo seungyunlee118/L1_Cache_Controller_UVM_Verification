@@ -34,6 +34,11 @@ class l1_cache_base_test extends uvm_test;
 
         uvm_config_db#(l1_cache_config)::set(this, "*", "cfg", cfg);
 
+        // A deadlocked DUT (stall that never releases) would otherwise keep
+        // the clock running until UVM's 9200 s default. The longest test
+        // finishes in ~270 us; +UVM_TIMEOUT can still override this.
+        uvm_root::get().set_timeout(5ms, 1);
+
         env = l1_cache_env::type_id::create("env", this);
     endfunction
 

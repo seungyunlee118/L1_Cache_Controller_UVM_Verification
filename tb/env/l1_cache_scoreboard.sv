@@ -10,7 +10,8 @@ class l1_cache_scoreboard extends uvm_scoreboard;
 
     typedef struct {
         bit [31:0] addr;
-        bit [31:0] exp_data;
+        bit [31:0] exp_data;    // what the cache model says the line holds
+        bit [31:0] arch_data;   // what the last store to this address wrote
         bit        skip;        // line was poisoned by an async reset
     } pending_read_t;
 
@@ -30,20 +31,43 @@ class l1_cache_scoreboard extends uvm_scoreboard;
     uvm_analysis_port #(l1_cache_item) cov_ap;
 
     // ---- golden model ------------------------------------------------------
-    tag_t      m_tag   [SETS][WAYS];
-    bit        m_valid [SETS][WAYS];
-    bit        m_dirty [SETS][WAYS];
-    bit [31:0] m_data  [SETS][WAYS][WORDS_PER_LINE];
-    plru_t     m_plru  [SETS];
+    // Geometry and address split are taken from the spec, not from the
+    // l1_cache_pkg helpers the RTL calls. A bug in a shared helper sits in
+    // the DUT and in the model at the same time, so no comparison between
+    // them can see it - the mutation campaign (sim/xcelium/mutate.py)
+    // showed a PLRU and a word-select bug in l1_cache_pkg passing every test
+    // while the model reused those helpers.
+    localparam int M_SETS  = 64;   // addr[9:4]
+    localparam int M_WAYS  = 4;
+    localparam int M_WORDS = 4;    // addr[3:2]
+
+    bit [21:0] m_tag   [M_SETS][M_WAYS];   // addr[31:10]
+    bit        m_valid [M_SETS][M_WAYS];
+    bit        m_dirty [M_SETS][M_WAYS];
+    bit [31:0] m_data  [M_SETS][M_WAYS][M_WORDS];
+
+    // Tree-PLRU, one tree per set. Node 0 is the root over the pairs
+    // {0,1} / {2,3}, node 1 sits over ways {0,1}, node 2 over ways {2,3}.
+    // A node holding 1 points at its upper child: that side has the next
+    // victim. Touching a way points every node on its path the other way.
+    bit        m_plru  [M_SETS][3];
 
     bit [31:0] main_mem [int];   // predicted DRAM, keyed by word address
     bit        poisoned [int];   // line addresses whose DRAM content is uncertain
+
+    // ---- architectural reference -------------------------------------------
+    // A flat memory with no cache in it: every store lands here at once and
+    // every load must return what is here. A cache is meant to be invisible,
+    // so this has to agree with the DUT whatever ways, victims and
+    // write-backs look like - it is the check that still holds if the cache
+    // model and the DUT ever share a mistake.
+    bit [31:0] arch_mem [int];
 
     pending_read_t rd_q     [$];
     exp_mem_t      exp_mem_q[$];
 
     // ---- statistics --------------------------------------------------------
-    int match_cnt, mismatch_cnt, skipped_cnt;
+    int match_cnt, mismatch_cnt, skipped_cnt, arch_cnt;
     int total_reads, total_writes;
     int hit_cnt, miss_cnt, evict_cnt, reset_cnt;
     int way_use [WAYS];
@@ -66,6 +90,46 @@ class l1_cache_scoreboard extends uvm_scoreboard;
         return main_mem.exists(word_addr) ? main_mem[word_addr] : `L1_MEM_DEFAULT(word_addr);
     endfunction
 
+    function bit [31:0] arch_value(bit [31:0] word_addr);
+        return arch_mem.exists(word_addr) ? arch_mem[word_addr] : `L1_MEM_DEFAULT(word_addr);
+    endfunction
+
+    // ---- spec address split ------------------------------------------------
+    function int        ref_set (bit [31:0] a); return int'(a[9:4]);   endfunction
+    function bit [21:0] ref_tag (bit [31:0] a); return a[31:10];       endfunction
+    function int        ref_word(bit [31:0] a); return int'(a[3:2]);   endfunction
+    function bit [31:0] ref_line(bit [31:0] a); return {a[31:4], 4'b0}; endfunction
+
+    function bit [31:0] ref_line_addr(bit [21:0] tg, int st);
+        return {tg, st[5:0], 4'b0};
+    endfunction
+
+    // ---- spec tree-PLRU ----------------------------------------------------
+    function int ref_plru_victim(int st);
+        int pair;
+        pair = m_plru[st][0];                   // 0 -> ways {0,1}, 1 -> ways {2,3}
+        return 2*pair + m_plru[st][1 + pair];
+    endfunction
+
+    function void ref_plru_touch(int st, int way);
+        int pair;
+        pair = way / 2;
+        m_plru[st][0]        = (pair == 0);     // point at the other pair
+        m_plru[st][1 + pair] = (way % 2 == 0);  // point at the other way in it
+    endfunction
+
+    virtual function void build_phase(uvm_phase phase);
+        super.build_phase(phase);
+        // The model is written for the geometry in the spec. If the package
+        // is ever re-parameterised, stop rather than compare against the
+        // wrong shape.
+        if (SETS != M_SETS || WAYS != M_WAYS || WORDS_PER_LINE != M_WORDS ||
+            ADDR_WIDTH != 32 || DATA_WIDTH != 32)
+            `uvm_fatal("SCB_GEOMETRY", $sformatf(
+                "l1_cache_pkg geometry (%0d sets, %0d ways, %0d words) differs from the model's spec (%0d/%0d/%0d)",
+                SETS, WAYS, WORDS_PER_LINE, M_SETS, M_WAYS, M_WORDS))
+    endfunction
+
     //=========================================================================
     // Reset - flush the model exactly as the DUT flushes its flops.
     //=========================================================================
@@ -82,13 +146,18 @@ class l1_cache_scoreboard extends uvm_scoreboard;
         rd_q.delete();
         exp_mem_q.delete();
 
-        for (int s = 0; s < SETS; s++) begin
-            m_plru[s] = '0;
-            for (int w = 0; w < WAYS; w++) begin
+        for (int s = 0; s < M_SETS; s++) begin
+            for (int n = 0; n < 3; n++) m_plru[s][n] = 1'b0;
+            for (int w = 0; w < M_WAYS; w++) begin
                 m_valid[s][w] = 1'b0;
                 m_dirty[s][w] = 1'b0;
             end
         end
+
+        // Reset throws away every dirty line, so from here on memory is
+        // whatever reached DRAM. Lines whose DRAM content is unknown are
+        // poisoned above and skipped by both checks.
+        arch_mem = main_mem;
 
         `uvm_info("SCB", $sformatf("Model flushed on reset #%0d (%0d line(s) poisoned so far)",
                                    reset_cnt, poisoned.size()), UVM_LOW)
@@ -98,10 +167,11 @@ class l1_cache_scoreboard extends uvm_scoreboard;
     // 1. A request was accepted at the CPU interface (read or write)
     //=========================================================================
     virtual function void write_req(l1_cache_item item);
-        set_t          st        = get_set(item.addr);
-        tag_t          tg        = get_tag(item.addr);
-        word_t         wd        = get_word(item.addr);
-        bit [31:0]     line_addr = get_line_addr(item.addr);
+        int            st        = ref_set(item.addr);
+        bit [21:0]     tg        = ref_tag(item.addr);
+        int            wd        = ref_word(item.addr);
+        bit [31:0]     line_addr = ref_line(item.addr);
+        bit [31:0]     word_addr = {item.addr[31:2], 2'b00};
         int            way       = -1;
         pending_read_t p;
         exp_mem_t      e;
@@ -109,10 +179,10 @@ class l1_cache_scoreboard extends uvm_scoreboard;
         if (!set_coverage.exists(st)) set_coverage[st] = 1;
         else                          set_coverage[st]++;
 
-        item.word_off = wd;
+        item.word_off = wd[1:0];
 
         // ---- look for a hit ------------------------------------------------
-        for (int w = 0; w < WAYS; w++)
+        for (int w = 0; w < M_WAYS; w++)
             if (m_valid[st][w] && m_tag[st][w] == tg) way = w;
 
         item.hit = (way != -1);
@@ -126,9 +196,9 @@ class l1_cache_scoreboard extends uvm_scoreboard;
 
             // ---- pick the victim: an invalid way first, else the PLRU tree --
             way = -1;
-            for (int w = WAYS-1; w >= 0; w--)
+            for (int w = M_WAYS-1; w >= 0; w--)
                 if (!m_valid[st][w]) way = w;
-            if (way == -1) way = int'(plru_victim(m_plru[st]));
+            if (way == -1) way = ref_plru_victim(st);
 
             if (!m_valid[st][way])       item.victim_state = l1_cache_item::VICTIM_INVALID;
             else if (!m_dirty[st][way])  item.victim_state = l1_cache_item::VICTIM_CLEAN;
@@ -137,9 +207,9 @@ class l1_cache_scoreboard extends uvm_scoreboard;
             // ---- dirty victim is written back first ------------------------
             if (m_valid[st][way] && m_dirty[st][way]) begin
                 e.rw   = 1'b1;
-                e.addr = make_line_addr(m_tag[st][way], st);
+                e.addr = ref_line_addr(m_tag[st][way], st);
                 e.skip = poisoned.exists(e.addr);
-                for (int k = 0; k < WORDS_PER_LINE; k++) begin
+                for (int k = 0; k < M_WORDS; k++) begin
                     e.beats[k]                  = m_data[st][way][k];
                     main_mem[e.addr + (k*4)]    = m_data[st][way][k];
                 end
@@ -152,7 +222,7 @@ class l1_cache_scoreboard extends uvm_scoreboard;
             e.rw   = 1'b0;
             e.addr = line_addr;
             e.skip = poisoned.exists(line_addr);
-            for (int k = 0; k < WORDS_PER_LINE; k++) begin
+            for (int k = 0; k < M_WORDS; k++) begin
                 e.beats[k]        = mem_value(line_addr + (k*4));
                 m_data[st][way][k] = e.beats[k];
             end
@@ -168,21 +238,28 @@ class l1_cache_scoreboard extends uvm_scoreboard;
 
         // ---- apply the access ----------------------------------------------
         if (item.rw == 1'b1) begin
+            bit [31:0] merged;
             total_writes++;
-            for (int b = 0; b < BE_WIDTH; b++)
-                if (item.be[b]) m_data[st][way][wd][b*8 +: 8] = item.wdata[b*8 +: 8];
-            m_dirty[st][way] = 1'b1;
+            merged = arch_value(word_addr);
+            for (int b = 0; b < 4; b++)
+                if (item.be[b]) begin
+                    m_data[st][way][wd][b*8 +: 8] = item.wdata[b*8 +: 8];
+                    merged[b*8 +: 8]              = item.wdata[b*8 +: 8];
+                end
+            m_dirty[st][way]    = 1'b1;
+            arch_mem[word_addr] = merged;
         end
         else begin
             total_reads++;
-            p.addr     = item.addr;
-            p.exp_data = m_data[st][way][wd];
-            p.skip     = poisoned.exists(line_addr);
+            p.addr      = item.addr;
+            p.exp_data  = m_data[st][way][wd];
+            p.arch_data = arch_value(word_addr);
+            p.skip      = poisoned.exists(line_addr);
             rd_q.push_back(p);
         end
 
         // PLRU is touched on every access, hit or fill.
-        m_plru[st] = plru_update(m_plru[st], way_t'(way));
+        ref_plru_touch(st, way);
 
         cov_ap.write(item);
     endfunction
@@ -220,6 +297,16 @@ class l1_cache_scoreboard extends uvm_scoreboard;
                                                   item.addr, p.exp_data, item.rdata))
             mismatch_cnt++;
         end
+
+        // Reported on its own: a DUT that agrees with the cache model but not
+        // with flat memory has a bug that the model shares.
+        if (item.rdata === p.arch_data) begin
+            arch_cnt++;
+        end else begin
+            `uvm_error("ARCH_DATA_BUG", $sformatf("[FAIL] Read Addr=0x%08x returned 0x%08x, but the last store left 0x%08x",
+                                                  item.addr, item.rdata, p.arch_data))
+            mismatch_cnt++;
+        end
     endfunction
 
     //=========================================================================
@@ -254,10 +341,10 @@ class l1_cache_scoreboard extends uvm_scoreboard;
             return;
         end
 
-        if (item.beats.size() != WORDS_PER_LINE) begin
+        if (item.beats.size() != M_WORDS) begin
             `uvm_error("MEM_LEN",
                        $sformatf("[FAIL] Burst to 0x%08x carried %0d beats, expected %0d",
-                                 item.req_addr, item.beats.size(), WORDS_PER_LINE))
+                                 item.req_addr, item.beats.size(), M_WORDS))
             mismatch_cnt++;
             return;
         end
@@ -267,7 +354,7 @@ class l1_cache_scoreboard extends uvm_scoreboard;
             return;
         end
 
-        for (int k = 0; k < WORDS_PER_LINE; k++) begin
+        for (int k = 0; k < M_WORDS; k++) begin
             if (item.beats[k] !== e.beats[k]) begin
                 `uvm_error(e.rw ? "WRITE_BACK_BUG" : "FILL_DATA_BUG",
                            $sformatf("[FAIL] %s 0x%08x beat %0d: Exp=0x%08x, Act=0x%08x",
@@ -296,21 +383,22 @@ class l1_cache_scoreboard extends uvm_scoreboard;
 
     virtual function void report_phase(uvm_phase phase);
         int  covered_sets = set_coverage.size();
-        real set_pct      = (real'(covered_sets) / real'(SETS)) * 100.0;
+        real set_pct      = (real'(covered_sets) / real'(M_SETS)) * 100.0;
         int  total_req    = total_reads + total_writes;
         real hit_rate     = (total_req == 0) ? 0.0 : (real'(hit_cnt) / real'(total_req)) * 100.0;
         string way_str    = "";
 
-        for (int w = 0; w < WAYS; w++) way_str = {way_str, $sformatf(" w%0d=%0d", w, way_use[w])};
+        for (int w = 0; w < M_WAYS; w++) way_str = {way_str, $sformatf(" w%0d=%0d", w, way_use[w])};
 
         `uvm_info(get_type_name(), "========================================", UVM_NONE)
         `uvm_info(get_type_name(), $sformatf(" SCOREBOARD SUMMARY: MATCH=%0d, MISMATCH=%0d", match_cnt, mismatch_cnt), UVM_NONE)
         `uvm_info(get_type_name(), "========================================", UVM_NONE)
+        `uvm_info(get_type_name(), $sformatf(" Architectural reads: %0d agree with flat memory", arch_cnt), UVM_NONE)
         `uvm_info(get_type_name(), $sformatf(" CPU reads / writes : %0d / %0d", total_reads, total_writes), UVM_NONE)
         `uvm_info(get_type_name(), $sformatf(" Cache hits / misses: %0d / %0d  (hit rate %0.2f%%)", hit_cnt, miss_cnt, hit_rate), UVM_NONE)
         `uvm_info(get_type_name(), $sformatf(" Dirty evictions    : %0d", evict_cnt), UVM_NONE)
         `uvm_info(get_type_name(), $sformatf(" Way utilisation    :%s", way_str), UVM_NONE)
-        `uvm_info(get_type_name(), $sformatf(" Set reach          : %0.2f%% (%0d/%0d)", set_pct, covered_sets, SETS), UVM_NONE)
+        `uvm_info(get_type_name(), $sformatf(" Set reach          : %0.2f%% (%0d/%0d)", set_pct, covered_sets, M_SETS), UVM_NONE)
         if (reset_cnt > 0)
             `uvm_info(get_type_name(), $sformatf(" Resets / poisoned  : %0d / %0d line(s), %0d check(s) skipped",
                                                  reset_cnt, poisoned.size(), skipped_cnt), UVM_NONE)

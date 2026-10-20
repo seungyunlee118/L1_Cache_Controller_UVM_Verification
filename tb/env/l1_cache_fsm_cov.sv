@@ -32,6 +32,19 @@ module l1_cache_fsm_cov
     wire req_backpressure = mem_req_valid && !mem_req_ready;
     wire wr_backpressure  = mem_wr_valid  && !mem_wr_ready;
 
+    // Transitions are covered on an explicit {previous, current} pair rather
+    // than with `=>` transition bins. The covergroup is gated off during reset,
+    // and a transition bin joins the last sample before reset to the first
+    // one after it: a reset in the middle of a miss then shows up as an
+    // illegal ST_FILL_RCV => ST_IDLE even though the FSM never took that arc.
+    // prev_state is cleared by the same reset as the FSM, so the history
+    // restarts cleanly.
+    cache_state_t prev_state;
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) prev_state <= ST_IDLE;
+        else        prev_state <= state;
+    end
+
     covergroup cg_fsm @(posedge clk iff rst_n);
         option.per_instance = 1;
         option.name         = "cache_fsm";
@@ -43,29 +56,31 @@ module l1_cache_fsm_cov
             bins fill_req = {ST_FILL_REQ};
             bins fill_rcv = {ST_FILL_RCV};
             bins complete = {ST_COMPLETE};
+        }
 
+        cp_trans: coverpoint {prev_state, state} {
             // Every legal transition must be seen.
-            bins t_idle_wb    = (ST_IDLE      => ST_WB_READ);
-            bins t_idle_fill  = (ST_IDLE      => ST_FILL_REQ);
-            bins t_wbrd_wbsnd = (ST_WB_READ   => ST_WB_SEND);
-            bins t_wbsnd_fill = (ST_WB_SEND   => ST_FILL_REQ);
-            bins t_freq_frcv  = (ST_FILL_REQ  => ST_FILL_RCV);
-            bins t_frcv_comp  = (ST_FILL_RCV  => ST_COMPLETE);
-            bins t_comp_idle  = (ST_COMPLETE  => ST_IDLE);
+            bins t_idle_wb    = {{ST_IDLE,     ST_WB_READ }};
+            bins t_idle_fill  = {{ST_IDLE,     ST_FILL_REQ}};
+            bins t_wbrd_wbsnd = {{ST_WB_READ,  ST_WB_SEND }};
+            bins t_wbsnd_fill = {{ST_WB_SEND,  ST_FILL_REQ}};
+            bins t_freq_frcv  = {{ST_FILL_REQ, ST_FILL_RCV}};
+            bins t_frcv_comp  = {{ST_FILL_RCV, ST_COMPLETE}};
+            bins t_comp_idle  = {{ST_COMPLETE, ST_IDLE    }};
 
             // ...and these must never happen.
-            illegal_bins t_bad = (ST_IDLE      => ST_WB_SEND),
-                                 (ST_IDLE      => ST_FILL_RCV),
-                                 (ST_IDLE      => ST_COMPLETE),
-                                 (ST_WB_READ   => ST_IDLE),
-                                 (ST_WB_READ   => ST_FILL_REQ),
-                                 (ST_WB_SEND   => ST_IDLE),
-                                 (ST_FILL_REQ  => ST_IDLE),
-                                 (ST_FILL_RCV  => ST_IDLE),
-                                 (ST_COMPLETE  => ST_WB_READ),
-                                 (ST_COMPLETE  => ST_WB_SEND),
-                                 (ST_COMPLETE  => ST_FILL_REQ),
-                                 (ST_COMPLETE  => ST_FILL_RCV);
+            illegal_bins t_bad = {{ST_IDLE,     ST_WB_SEND },
+                                  {ST_IDLE,     ST_FILL_RCV},
+                                  {ST_IDLE,     ST_COMPLETE},
+                                  {ST_WB_READ,  ST_IDLE    },
+                                  {ST_WB_READ,  ST_FILL_REQ},
+                                  {ST_WB_SEND,  ST_IDLE    },
+                                  {ST_FILL_REQ, ST_IDLE    },
+                                  {ST_FILL_RCV, ST_IDLE    },
+                                  {ST_COMPLETE, ST_WB_READ },
+                                  {ST_COMPLETE, ST_WB_SEND },
+                                  {ST_COMPLETE, ST_FILL_REQ},
+                                  {ST_COMPLETE, ST_FILL_RCV}};
         }
 
         cp_stall_len: coverpoint stall_len iff (pipeline_stall) {

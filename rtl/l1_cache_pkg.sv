@@ -6,7 +6,16 @@ package l1_cache_pkg;
     // Cache geometry
     //   4-way set associative, write-back / write-allocate, tree-PLRU
     //   4 words (16 B) per line x 64 sets x 4 ways = 4 KB
+    //   addr[31:10] = tag          (22b)
+    //   addr[ 9: 4] = set index    (6b -> 64 sets)
+    //   addr[ 3: 2] = word in line (2b -> 4 words)
+    //   addr[ 1: 0] = byte in word (2b, byte enables select bytes)
     // ------------------------------------------------------------------------
+    localparam int ADDR_WIDTH     = 32;
+    localparam int DATA_WIDTH     = 32;
+    localparam int BE_WIDTH       = DATA_WIDTH/8;          // 4
+
+    localparam int WAYS           = 4;
     localparam int WAY_BITS       = 2;                     // $clog2(WAYS)
     localparam int SETS           = 64;
     localparam int SET_BITS       = 6;                     // $clog2(SETS)

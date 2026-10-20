@@ -1,0 +1,28 @@
+// ---------------------------------------------------------------------------
+// Options shared by every xrun build (Makefile, regress.sh, mutate.py).
+// ---------------------------------------------------------------------------
+
+// 64-bit build: the 32-bit libz is missing on the lab server (*F,RNCNL).
+-64bit
+
+-uvm -uvmhome CDNS-1.2
+-sv
+-timescale 1ns/1ps
+-top tb_top
+
+// Covergroups are only sampled when functional coverage is enabled.
+// Each run writes its UCD under cov_work/scope/<covtest>/ for IMC merging.
+-coverage U
+-covoverwrite
+
+// Xcelium retires a cover directive after its first finish (hit) by default,
+// so its pass action runs once and the [SVA COVER] counts would all read 1.
+-abvfinishlimit 1000000000
+
+// CGPIDF: per_instance default reminder - the covergroups set it explicitly.
+// DPIEXP: the DPI export stub cannot be linked on a host without glibc-devel
+//         (see KNOWN_SIM_ERRORS in regress.sh); harmless in batch runs.
+-nowarn CGPIDF
+-nowarn DPIEXP
+
+-nocopyright

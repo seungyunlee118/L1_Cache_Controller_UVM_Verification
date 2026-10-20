@@ -1,0 +1,3 @@
+# Everything is committed with LF line endings. A shell script checked out
+# as CRLF fails on Linux with "bad interpreter: /bin/bash^M".
+* text=auto eol=lf
