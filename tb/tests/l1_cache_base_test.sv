@@ -36,8 +36,11 @@ class l1_cache_base_test extends uvm_test;
 
         // A deadlocked DUT (stall that never releases) would otherwise keep
         // the clock running until UVM's 9200 s default. The longest test
-        // finishes in ~270 us; +UVM_TIMEOUT can still override this.
-        uvm_root::get().set_timeout(5ms, 1);
+        // finishes in ~270 us. uvm_root has already applied any +UVM_TIMEOUT
+        // by now (its build_phase runs first), so only set the default when
+        // none was given - otherwise this would silently replace it.
+        if (!$test$plusargs("UVM_TIMEOUT"))
+            uvm_root::get().set_timeout(5ms, 1);
 
         env = l1_cache_env::type_id::create("env", this);
     endfunction

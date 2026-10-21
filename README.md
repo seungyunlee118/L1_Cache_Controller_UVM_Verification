@@ -230,14 +230,17 @@ python3 mutate.py                      # bug-injection campaign (section 4)
 
 `xcelium_env.sh` puts `$XCELIUM_HOME/tools.lnx86/bin` on `PATH` when `xrun`
 isn't there already. The default is the UH lab path, so override `XCELIUM_HOME`
-anywhere else. All build options live in one argument file, `xrun.args`. The
-regression builds once, then runs every test/seed from that snapshot with
-`xrun -R`. A run **passes only if** it reaches the scoreboard report, has
-`UVM_ERROR 0` / `UVM_FATAL 0`, and the simulator printed no `*E`/`*F`. Results
-go to `regress/results.txt`.
+anywhere else. Build options live in `xrun.args`, run-time options in
+`xrun_run.args`. The regression builds once in `regress/`, then runs every
+test/seed from that snapshot with `xrun -R`, each in its own
+`regress/runs/<test>_<seed>/` so parallel runs never share a file. A run
+**passes only if** it reaches the scoreboard report, has `UVM_ERROR 0` /
+`UVM_FATAL 0`, and the simulator printed no `*E`/`*F`. That rule lives in
+`judge.sh`, and `make run` uses it too, so `make` exits non-zero on a failing
+test. Results go to `regress/results.txt`.
 
 Coverage is sampled with `-coverage U`, and each run writes its UCD to
-`regress/cov_work/scope/<test>_<seed>/`, ready for `imc -exec` merging. The lab
+`regress/runs/<test>_<seed>/cov_work/`, ready for `imc -exec` merging. The lab
 host has no IMC, so `regress.sh` reports the best single run per covergroup.
 Both groups reach 100% in one run (`random_test` for `cache_ops`,
 `stress_test` for `cache_fsm`), so the merged score is 100% too.
@@ -246,7 +249,7 @@ Both groups reach 100% in one run (`random_test` for `cache_ops`,
 > headers), so xmelab cannot link the DPI export stub, and xmsim prints
 > `*E,IMPDLL`. Only UVM's interactive Tcl helpers and its C-side error
 > reporting use those exports, so batch results are unaffected.
-> `regress.sh` allows exactly that code (`KNOWN_SIM_ERRORS`). On a host with
+> `judge.sh` allows exactly that code (`KNOWN_SIM_ERRORS`). On a host with
 > glibc-devel the message goes away.
 >
 > The same host has only 64-bit X11 libraries. A plain `simvision` starts the

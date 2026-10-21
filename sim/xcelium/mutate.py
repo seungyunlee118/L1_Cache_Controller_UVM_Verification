@@ -10,6 +10,8 @@ failing run.
     KILLED    some run failed - UVM error, SVA failure, timeout or sim error
     SURVIVED  every run passed: the testbench cannot see this bug
     INVALID   the substitution did not apply exactly once, or it did not build
+    ERROR     a run failed for a tool reason (license, crash, wall-clock limit),
+              so the mutant was not judged; rerun it
 
 An unmutated baseline runs first and must pass, otherwise the campaign stops.
 
@@ -186,6 +188,21 @@ EQUIVALENT = {
 }
 
 
+# Simulator message codes that are testbench checks rather than tool trouble.
+# EILLTB is an illegal_bins hit in the FSM covergroup.
+SIM_CHECKS = {"EILLTB"}
+
+
+def is_testbench_check(reason):
+    """True if a failing run was stopped by the testbench (a UVM report, an
+    SVA, an illegal bin, the UVM timeout), False for infrastructure trouble -
+    a license, a crash, the wall-clock limit - which says nothing about
+    whether the bug was caught."""
+    if reason.startswith("SIM:"):
+        return reason[4:] in SIM_CHECKS
+    return reason not in ("WALL_TIMEOUT", "NO_REPORT", "NO_SUMMARY")
+
+
 def prepare(mid, fname, old, new):
     """Copy rtl/ into mutants/<mid>/rtl, apply the change, write a filelist.
     Returns an error string, or None."""
@@ -204,9 +221,11 @@ def prepare(mid, fname, old, new):
         with open(path, "w") as f:
             f.write(text.replace(old, new))
 
-    rel = os.path.relpath(os.path.join(work, "rtl"), HERE)
+    # Absolute paths: regress.sh builds from inside the mutant's own directory.
+    root = os.path.normpath(os.path.join(HERE, "..", ".."))
     with open(os.path.join(HERE, "files.f")) as f:
-        flist = f.read().replace("../../rtl/", rel + "/")
+        flist = (f.read().replace("../../rtl/", os.path.join(work, "rtl") + "/")
+                          .replace("../../", root + "/"))
     with open(os.path.join(work, "files.f"), "w") as f:
         f.write(flist)
     return None
@@ -231,7 +250,10 @@ def run(mid, seeds):
         return "INVALID", "does not build", secs
     for f in lines:
         if f[2] == "FAIL":
-            return "KILLED", "%s seed %s: %s" % (f[0].replace("l1_cache_", ""), f[1], f[3]), secs
+            detail = "%s seed %s: %s" % (f[0].replace("l1_cache_", ""), f[1], f[3])
+            if not is_testbench_check(f[3]):
+                return "ERROR", detail, secs
+            return "KILLED", detail, secs
     if mid in EQUIVALENT:
         return "EQUIVALENT", "%d run(s) passed (see note)" % len(lines), secs
     return "SURVIVED", "%d run(s) passed" % len(lines), secs
@@ -280,6 +302,7 @@ def main():
     killed = sum(1 for r in results.values() if r[0] == "KILLED")
     valid = sum(1 for r in results.values() if r[0] in ("KILLED", "SURVIVED"))
     equiv = [mid for mid, r in sorted(results.items()) if r[0] == "EQUIVALENT"]
+    errors = [mid for mid, r in sorted(results.items()) if r[0] == "ERROR"]
     score = 100.0 * killed / valid if valid else 0.0
 
     with open(os.path.join(OUT, "report.md"), "w") as f:
@@ -293,9 +316,14 @@ def main():
             f.write("| %s | %s | %s | %s | %s |\n" % (mid, fname, desc, st, detail))
         for mid in equiv:
             f.write("\n**%s is equivalent.** %s\n" % (mid, EQUIVALENT[mid]))
+        if errors:
+            f.write("\n**Not judged (tool error, rerun):** %s\n" % ", ".join(errors))
 
     print("\nkilled %d / %d non-equivalent mutants (%.1f%%), %d equivalent - report: mutants/report.md"
           % (killed, valid, score, len(equiv)))
+    if errors:
+        print("%d mutant(s) hit a tool error and were not judged: %s" % (len(errors), " ".join(errors)))
+        return 4
     return 0 if killed == valid else 3
 
 

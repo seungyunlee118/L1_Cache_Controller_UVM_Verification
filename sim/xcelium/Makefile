@@ -26,7 +26,7 @@ PLUSARGS ?=
 
 LIBDIR := xcelium$(if $(XPROP),_xprop$(XPROP)).d
 
-RUN_OPTS := -f xrun.args -f files.f -xmlibdirname $(LIBDIR) \
+RUN_OPTS := -F xrun.args -F files.f -xmlibdirname $(LIBDIR) \
             -covtest $(TEST)_$(SEED) -svseed $(SEED) +UVM_TESTNAME=$(TEST) $(PLUSARGS)
 ifneq ($(XPROP),)
 RUN_OPTS += -xprop $(XPROP)
@@ -42,11 +42,15 @@ endif
 
 all: run
 
+# Exits non-zero when the run fails the same rule regress.sh uses (judge.sh),
+# so `make && ...` stops on a broken test. xrun's own exit code is not used:
+# it is 1 on the lab host for every run because of the known IMPDLL message.
 run:
-	@source ./xcelium_env.sh && xrun $(RUN_OPTS) -l xrun.log > /dev/null; \
+	@source ./xcelium_env.sh && source ./judge.sh && xrun $(RUN_OPTS) -l xrun.log > /dev/null; \
 	echo; echo "=== RESULT ($(TEST), seed $(SEED)) ==="; \
 	grep -E "SCOREBOARD SUMMARY|Architectural reads|CPU reads|hits / misses|Dirty evictions|Way utilisation|Set reach|Resets / poisoned|cache_ops covergroup|FSM COV|SVA COVER|UVM_ERROR :|UVM_FATAL :" xrun.log; \
-	grep -E "^UVM_(ERROR|FATAL) .* @ " xrun.log | head -5; true
+	grep -E "^UVM_(ERROR|FATAL) .* @ " xrun.log | head -5; \
+	verdict=$$(judge xrun.log); echo "=== $$verdict ==="; [ "$${verdict%% *}" = PASS ]
 
 # Plain `simvision` starts the 32-bit binary, which needs the 32-bit libX11 the
 # lab host does not have; -64bit picks the 64-bit one. view.tcl lays out the

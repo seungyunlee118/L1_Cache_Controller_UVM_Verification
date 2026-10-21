@@ -67,7 +67,8 @@ class l1_cache_scoreboard extends uvm_scoreboard;
     exp_mem_t      exp_mem_q[$];
 
     // ---- statistics --------------------------------------------------------
-    int match_cnt, mismatch_cnt, skipped_cnt, arch_cnt;
+    int match_cnt, mismatch_cnt, skipped_cnt;
+    int arch_cnt, arch_mismatch_cnt;   // flat-memory check, counted on its own
     int total_reads, total_writes;
     int hit_cnt, miss_cnt, evict_cnt, reset_cnt;
     int way_use [WAYS];
@@ -305,7 +306,7 @@ class l1_cache_scoreboard extends uvm_scoreboard;
         end else begin
             `uvm_error("ARCH_DATA_BUG", $sformatf("[FAIL] Read Addr=0x%08x returned 0x%08x, but the last store left 0x%08x",
                                                   item.addr, item.rdata, p.arch_data))
-            mismatch_cnt++;
+            arch_mismatch_cnt++;
         end
     endfunction
 
@@ -377,8 +378,9 @@ class l1_cache_scoreboard extends uvm_scoreboard;
             `uvm_error("SCB_DANGLING", $sformatf("%0d read(s) never got a response", rd_q.size()))
         if (exp_mem_q.size() != 0)
             `uvm_error("SCB_MEM_MISSING", $sformatf("%0d predicted memory burst(s) never happened", exp_mem_q.size()))
-        if (mismatch_cnt != 0)
-            `uvm_error("SCB_FAILED", $sformatf("%0d mismatch(es) detected", mismatch_cnt))
+        if (mismatch_cnt != 0 || arch_mismatch_cnt != 0)
+            `uvm_error("SCB_FAILED", $sformatf("%0d model mismatch(es), %0d architectural mismatch(es)",
+                                               mismatch_cnt, arch_mismatch_cnt))
     endfunction
 
     virtual function void report_phase(uvm_phase phase);
@@ -393,7 +395,7 @@ class l1_cache_scoreboard extends uvm_scoreboard;
         `uvm_info(get_type_name(), "========================================", UVM_NONE)
         `uvm_info(get_type_name(), $sformatf(" SCOREBOARD SUMMARY: MATCH=%0d, MISMATCH=%0d", match_cnt, mismatch_cnt), UVM_NONE)
         `uvm_info(get_type_name(), "========================================", UVM_NONE)
-        `uvm_info(get_type_name(), $sformatf(" Architectural reads: %0d agree with flat memory", arch_cnt), UVM_NONE)
+        `uvm_info(get_type_name(), $sformatf(" Architectural reads: %0d agree, %0d disagree with flat memory", arch_cnt, arch_mismatch_cnt), UVM_NONE)
         `uvm_info(get_type_name(), $sformatf(" CPU reads / writes : %0d / %0d", total_reads, total_writes), UVM_NONE)
         `uvm_info(get_type_name(), $sformatf(" Cache hits / misses: %0d / %0d  (hit rate %0.2f%%)", hit_cnt, miss_cnt, hit_rate), UVM_NONE)
         `uvm_info(get_type_name(), $sformatf(" Dirty evictions    : %0d", evict_cnt), UVM_NONE)
