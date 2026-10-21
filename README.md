@@ -1,66 +1,72 @@
 # Pipelined L1 Cache Controller — UVM Verification
 
-4-way set associative, write-back / write-allocate L1 data cache with a 2-stage
-pipeline, tree-PLRU replacement, 16-byte lines filled and evicted as bursts, and
-byte-enable writes.
+A 4 KB, 4-way set-associative, write-back / write-allocate L1 data cache with a
+2-stage pipeline, tree-PLRU replacement, 16-byte burst fills and evictions, and
+byte-enable writes. It is verified with a UVM testbench on **Cadence Xcelium
+24.09**, and the testbench itself was checked by injecting bugs into the RTL.
 
-Verified with a UVM testbench: golden cache reference model, constrained-random
-stimulus, a reactive burst memory responder with variable latency and
-backpressure on both channels, a reset agent, SVA, and functional + white-box
-FSM coverage merged across the regression.
+| | |
+|---|---|
+| Regression (11 tests × 4 seeds) | **44 / 44 pass** in ~20 s, UVM_ERROR 0, SVA failures 0 |
+| X-propagation (`-xprop C`) | **44 / 44 pass**, every RTL block X-prop enabled |
+| Seed sweep (11 tests × 20 seeds) | **220 / 220 pass** |
+| Functional coverage | `cache_ops` **100%**, `cache_fsm` **100%** |
+| Bug injection (32 RTL mutants) | **31 / 31 killed**, plus 1 mutant that is provably undetectable (equivalent) |
 
-Simulators: **Cadence Xcelium 24.09** (CDNS UVM 1.2) and **Vivado xsim 2025.2**
-(built-in UVM 1.2).
+**What makes this testbench different**
+
+- **Two independent checkers.** A cycle-accurate golden *cache* model predicts
+  every hit, miss, victim, write-back and fill. A flat *architectural* memory
+  separately checks that a load returns the last value stored at that address.
+- **Bug injection, not just coverage.** 100% coverage only says a scenario
+  happened. The mutation campaign shows that bugs in those scenarios are
+  actually caught. It also exposed a blind spot that coverage could not: a
+  data-loss bug that passed every test at 100% coverage ([§4](#4-does-the-testbench-catch-bugs)).
+- **A reactive memory responder** with random latency, request backpressure
+  and gaps between beats on both burst channels.
+- **A reset agent** that resets in the middle of traffic, including mid-burst.
+
+<p align="center">
+  <img src="docs/img/xcelium_regression.webp" width="520" alt="Xcelium regression: 44 of 44 runs pass">
+</p>
+
+---
+
+## Contents
+
+1. [Design](#1-design)
+2. [Testbench](#2-testbench)
+3. [Reading the waveform](#3-reading-the-waveform)
+4. [Does the testbench catch bugs?](#4-does-the-testbench-catch-bugs)
+5. [Running it](#5-running-it)
+6. [Tests](#6-tests)
+7. [Bugs found along the way](#7-bugs-found-along-the-way)
+8. [Limitations and next steps](#8-limitations-and-next-steps)
 
 ```
-Xcelium  regress.sh       ->  44/44 pass  (11 tests x 4 seeds), 21 s
-         regress.sh -x C  ->  44/44 pass  with X-propagation (CAT mode on all RTL)
-         20-seed sweep    ->  220/220 pass
-                              UVM_ERROR 0, UVM_FATAL 0, SVA failures 0
-                              cache_ops coverage : 100%   cache_fsm coverage : 100%
-         mutate.py        ->  31/31 injected RTL bugs killed (+1 provably equivalent)
-
-xsim     regress.bat      ->  44/44 pass, merged functional coverage 100% (xcrg)
+rtl/            l1_cache_pkg, l1_cache_core (pipeline + miss FSM), l1_cache_top, sram_macro
+tb/             interface + SVA, agents, scoreboard, coverage, sequences, tests
+sim/xcelium/    Makefile, regress.sh, mutate.py, judge.sh, view.tcl   <- primary flow
+sim/vivado/     Makefile, regress.bat / run.bat                        <- original xsim flow
 ```
 
 ---
 
-## 1. Architecture
+## 1. Design
 
-<img width="893" height="527" alt="Image" src="https://github.com/user-attachments/assets/605ab956-8489-4566-8bd6-9132d8ddcdcb" />
-
-```
-        S1                                S2
-   ┌───────────┐                    ┌──────────────────┐
-   │ CPU req   │  set index ───────▶│ 4x tag SRAM      │──▶ 4-way compare ──▶ hit/way
-   │ valid/rw  │  {set,word} ──────▶│ 4x data SRAM     │──▶ way mux ────────▶ rdata
-   │ addr/be   │                    └──────────────────┘
-   │ wdata     │                    valid/dirty/PLRU in flops
-   └───────────┘   pipeline reg (holds while stalled)
-        ▲
-   cpu_req_ready = ~pipeline_stall
-```
+<img width="893" height="527" alt="L1 cache block diagram" src="https://github.com/user-attachments/assets/605ab956-8489-4566-8bd6-9132d8ddcdcb" />
 
 | | |
 |---|---|
-| Organisation | 4-way set associative |
-| Sets / ways | 64 sets x 4 ways = 256 lines |
-| Line size | 4 words (16 B) → 4 KB total |
-| Policy | write-back, write-allocate |
-| Replacement | tree-PLRU (3 bits/set), invalid ways filled first |
-| Writes | byte enables (`cpu_req_be[3:0]`) |
+| Organisation | 64 sets × 4 ways × 16 B lines = 4 KB |
 | Address split | `tag = addr[31:10]`, `set = addr[9:4]`, `word = addr[3:2]`, `byte = addr[1:0]` |
-| Array model | registered read port (address in cycle N → data in cycle N+1) |
-| Memory | burst: request + separate write-data and read-data channels, 4 beats |
-| Latency | read hit = 1 cycle; miss = fill (+ write-back if the victim is dirty) |
+| Policy | write-back, write-allocate, byte-enable stores |
+| Replacement | tree-PLRU (3 bits per set), invalid ways filled first |
+| Pipeline | S1 presents the index to the tag/data SRAMs, S2 compares 4 ways and answers |
+| Memory port | request channel plus separate write-data and read-data channels, 4-beat bursts with `LAST` |
+| Latency | read hit 1 cycle; a miss stalls S1 for the fill, plus a write-back if the victim is dirty |
 
-The RTL's address split lives in one place — `get_set()` / `get_tag()` /
-`get_word()` / `make_line_addr()` in `rtl/l1_cache_pkg.sv`. Stimulus may use
-those helpers, but the **scoreboard deliberately does not**: it decodes
-addresses and runs its own tree-PLRU straight from the spec. Sharing them made a
-bug in the package invisible — see [§4](#4-mutation-campaign--does-the-testbench-catch-bugs).
-
-### FSM
+### Miss FSM
 
 ```
   ST_IDLE ──miss, clean victim──────────────────────▶ ST_FILL_REQ
@@ -68,39 +74,28 @@ bug in the package invisible — see [§4](#4-mutation-campaign--does-the-testbe
      └─miss, dirty victim──▶ ST_WB_READ ──▶ ST_WB_SEND ────┘
                             (buffer line)   (stream out)   │
                                                            ▼
-                                                     ST_FILL_RCV
-                                                           │
-                                                           ▼
-        ST_IDLE ◀────────────────────────────────── ST_COMPLETE
+        ST_IDLE ◀──────────── ST_COMPLETE ◀──────────── ST_FILL_RCV
 ```
 
-Each state has exactly one job. `ST_COMPLETE` costs one extra cycle per miss
-but removes the structural conflict between the last fill beat and the pending
-store's write, and it is where the tag, valid/dirty and PLRU are committed.
-Stall is released in `ST_COMPLETE` so the pipeline advances at the end of that
-cycle — otherwise S2 would still hold the request in `ST_IDLE` next cycle and
-answer it a second time.
+Each state has one job. `ST_COMPLETE` costs one extra cycle per miss, but it
+removes the conflict between the last fill beat and the pending store's write.
+It is also where tag, valid/dirty and PLRU are committed and the stall is
+released.
 
-### Three things worth understanding
+### Three design points
 
-**Registered array reads + read-during-write forwarding.**
-The array read port samples memory *before* the write of that same edge lands.
-If the previous cycle wrote the location being read, the core forwards the write
-data around the array. The comparison is against the address actually issued
-last cycle (`prev_*_raddr`), not against S2 — during `ST_WB_READ` the read
-address walks the line and is not `s2_word`. Data forwarding is **per byte**,
-because a store may have written only some lanes.
-
-**Why there is no combinational loop.**
-`tag_raddr` is selected using `pipeline_stall`, but `tag_rdata` is a flop
-output, so nothing downstream of the read feeds back into the stall. With a
-combinational-read SRAM this same mux *does* close a loop:
-`stall → raddr → rdata → hit → stall`.
-
-**Valid/dirty/PLRU live in flops, not SRAM.**
-Reset therefore flushes the entire cache in one cycle, with no power-on
-invalidate walk and no need for non-synthesisable 4-state compares to cope with
-an uninitialised tag array.
+- **Registered SRAM reads with per-byte forwarding.** A read samples the array
+  before the same edge's write lands. If last cycle wrote the location being
+  read, the core forwards the write data byte by byte, because a store may have
+  written only some lanes. The forwarding compares against the address actually
+  issued last cycle, not S2's address: during `ST_WB_READ` the read address
+  walks the line.
+- **No combinational loop.** The read address depends on `pipeline_stall`, but
+  the read data is a flop output, so nothing loops back into the stall. With a
+  combinational SRAM, `stall → raddr → rdata → hit → stall` would be a loop.
+- **Valid, dirty and PLRU bits live in flops.** Reset flushes the whole cache in
+  one cycle, with no invalidate walk and no X-compare tricks on an uninitialised
+  tag array.
 
 ---
 
@@ -110,382 +105,285 @@ an uninitialised tag array.
 tb_top
  ├─ bind l1_cache_fsm_cov -> l1_cache_core        (white-box FSM coverage)
  └─ l1_cache_env
-     ├─ cpu_agt   sequencer + driver + monitor   ── req_ap ─┐
-     │                                           ── rsp_ap ─┤
-     ├─ mem_agt   sequencer + burst responder + monitor ────┤
-     ├─ rst_agt   sequencer + reset driver       ── ap ─────┤
-     ├─ scb       golden CACHE model  ◀──────────────────────┘
+     ├─ cpu_agt   sequencer + driver + monitor   ── req_ap / rsp_ap ─┐
+     ├─ mem_agt   sequencer + burst responder + monitor ─────────────┤
+     ├─ rst_agt   sequencer + reset driver       ── ap ──────────────┤
+     ├─ scb       golden cache model + architectural memory ◀───────┘
      └─ cov       functional coverage ◀── scb.cov_ap
 ```
 
-### Golden cache model
+### Checking
 
-The scoreboard mirrors the DUT's tag / valid / dirty / data arrays across all
-four ways, the PLRU tree, and main memory. For every CPU request it predicts
-hit or miss **and which way**, the exact data a read must return (byte-enable
-accurate), whether the PLRU victim is dirty and must be written back — to which
-address, with which four beats — and the fill burst that follows with the data
-it must carry. Observed memory traffic is checked against that prediction **in
-order**, so a spurious, missing, mis-addressed, mis-ordered or wrong-length
-burst fails the test.
+| Checker | What it predicts | Catches |
+|---|---|---|
+| **Golden cache model** (`READ_DATA_BUG`, `MEM_*`, `WRITE_BACK_BUG`) | tag/valid/dirty/data for all 4 ways, the PLRU tree and DRAM: hit or miss, which way, the victim, its write-back address and beats, the fill burst and its data | wrong data, a spurious, missing, mis-addressed or mis-ordered burst, a wrong burst length, a wrong victim |
+| **Architectural flat memory** (`ARCH_DATA_BUG`) | only "a load returns the last value stored there" | any data loss, even when the cache model shares the bug |
+| **SVA** in `l1_cache_if.sv` (15 assertions) | handshake hold, payload stability, X/Z on every channel, line alignment, `len+1` beats with `LAST` on the final one | protocol violations |
+| **`check_phase`** | no traffic, dangling reads, predicted bursts that never happened | a silent testbench passing |
 
-The model is written from the spec (`addr[9:4]` is the set, a 3-node PLRU tree
-per set), not by calling the RTL's package functions, and a build-phase check
-stops the run if the package geometry ever stops matching it.
+The model is written **from the spec**: its own address decode and its own
+3-node PLRU tree. It does not call the RTL's `l1_cache_pkg` helpers. Sharing
+them is how a package bug once passed everything (section 4). A build-phase
+check stops the run if the package geometry ever stops matching the model.
 
-Every read is also checked a second way, against an **architectural flat
-memory** that knows nothing about caching: each store lands in it at once, and a
-load must return the last value stored to that address. A cache is supposed to be
-invisible, so this check holds no matter what the ways, victims and write-backs
-look like. It is the check that still works if the cache model and the DUT ever
-share a mistake (`ARCH_DATA_BUG`, reported separately from `READ_DATA_BUG`).
-After a reset it restarts from the predicted DRAM contents, because reset
-discards dirty lines.
+**Ordering.** The CPU monitor publishes every accepted request in issue order
+(`req_ap`) and read data separately (`rsp_ap`). Expected data is snapshotted
+when the read is issued and compared when it returns. The pipeline can retire
+a miss in the same cycle it accepts the next request, so comparing against the
+model's *current* state would give false failures.
 
-### Ordering
-
-The CPU monitor publishes on **two** analysis ports: `req_ap` (every accepted
-request, read and write, in issue order) and `rsp_ap` (read responses). The
-expected value for a read is snapshot at **issue** time and checked at
-**response** time. That matters because the DUT is pipelined: a read miss can
-retire in the very same cycle the next request is accepted, so comparing
-against the *current* reference state yields false failures.
-
-### Memory responder
-
-`l1_cache_mem_rsp_seq` feeds the memory driver one timing item per burst:
-randomised fill latency, randomised request-channel backpressure, and
-randomised gaps between beats. The stress test runs 10–50 cycle latency with
-60% of bursts seeing up to 6 cycles of request backpressure and gaps on both
-the write-data and read-data channels.
-
-### Reset
-
-The reset agent owns `rst_n`, performs the power-on reset, and can re-assert it
-mid-traffic. It announces every reset on an analysis port so the scoreboard
-flushes its model at exactly the same instant the DUT flushes its flops. Two
-flavours:
-
-* `l1_cache_reset_test` — the memory bus is allowed to go idle first, so
-  nothing can be lost mid-burst and **every check stays live**.
-* `l1_cache_reset_async_test` — reset fires at an arbitrary moment, including
-  mid-burst. A write-back cut in half leaves DRAM in a state the model cannot
-  reconstruct, so the scoreboard **poisons just those line addresses** and
-  skips their data comparison. Every protocol, ordering and burst-length check
-  stays active. In practice at most one line is poisoned per reset; the count
-  is reported.
+**Reset.** The reset agent owns `rst_n` and tells the scoreboard just before
+each reset, so the model flushes at the same moment as the DUT.
+`reset_test` waits for an idle bus first. `reset_async_test` fires at any
+moment, including mid-burst. A write-back cut in half leaves DRAM
+unpredictable, so only that line is *poisoned* (its data checks are skipped).
+Every protocol and ordering check stays live.
 
 ### Coverage
 
-| | |
+| Covergroup | Bins |
 |---|---|
-| `cache_ops` (subscriber) | rw, hit/miss, eviction, victim state (cold / clean / dirty), **way**, **word within line**, set reach, **byte-enable shape**, and 6 crosses |
-| `cache_fsm` (bind into the core) | state, all legal transitions, `illegal_bins` on 12 illegal ones, stall-length buckets, backpressure on both memory channels, **fill beat position**, **victim way**, **hit way** |
+| `cache_ops` (fed by the scoreboard) | rw × hit/miss, eviction, victim state (cold / clean / dirty), way, word in line, set reach, byte-enable shape, 6 crosses |
+| `cache_fsm` (bound into the core) | every state, the 7 legal transitions, 12 `illegal_bins` transitions, stall length, backpressure on both channels, fill-beat position, victim way, hit way |
 
-Coverage is fed from the **scoreboard**, not the monitor — hit/miss, way and
-victim state only exist in the reference model, not on the pins.
-
-FSM transitions are covered on an explicit `{prev_state, state}` pair, with
-`prev_state` cleared by the same reset as the FSM. Plain `=>` transition bins
-don't work here. The covergroup is gated off during reset, so the last sample
-before a reset and the first one after it look consecutive: a reset in the
-middle of a miss then registers as the illegal `ST_FILL_RCV => ST_IDLE`.
-Xcelium flagged exactly that (`*E,EILLTB`) in every reset test.
-
-Assertions live in `tb/l1_cache_if.sv`: handshake hold, payload stability, X/Z
-checks on every channel, line alignment, and **burst beat accounting** (each
-burst must deliver exactly `len+1` beats with `LAST` on the final one).
-
-Each `cover property` counts its hits in its pass action, and the counts are
-printed as `[SVA COVER] ...` at the end of the run. That way they are visible
-without a coverage viewer, and as a side effect the dirty-eviction count from
-the cover matches the scoreboard's exactly (470 for `random_test` seed 1).
-
-> xsim ignores `cover property` (it prints `XSIM 43-4127` at elaboration).
-> Xcelium retires a cover after its first hit unless `-abvfinishlimit` is
-> raised, which `xrun.args` does.
+Coverage comes from the scoreboard because hit/miss, way and victim state exist
+only in the model, not on the pins. FSM transitions are covered as a
+`{prev_state, state}` pair cleared by reset. Plain `=>` bins join the samples
+on either side of a reset and report a false illegal transition. Each
+`cover property` counts its hits and prints them as `[SVA COVER]`, and the
+eviction count matches the scoreboard's exactly.
 
 ---
 
-## 3. Running
+## 3. Reading the waveform
 
-### Cadence Xcelium  (`sim/xcelium`)
+`make WAVE=1 TEST=l1_cache_be_test SEED=7` followed by `make view` opens this in
+SimVision, with the signals already grouped by `view.tcl`:
 
-```bash
-cd sim/xcelium
+<p align="center">
+  <img src="docs/img/simvision_first_misses.webp" alt="SimVision: the first eight cache misses of l1_cache_be_test seed 7">
+</p>
 
-make                                   # build + run the default test
-make TEST=l1_cache_stress_test SEED=42
-make XPROP=C                           # X-propagation build (CAT; F for FOX)
-make WAVE=1                            # SHM dump -> waves.shm
-make view                              # open it with the view.tcl signal layout
-make GUI=1                             # interactive SimVision
-make PLUSARGS="+NUM_TRANS=500 +SEQ=l1_cache_rand_seq"
+The byte-enable test writes a full word, overwrites some of its bytes, and reads
+it back. The first miss, from the actual values in the database:
 
-./regress.sh                           # 11 tests x 4 seeds, 4 runs in parallel
-./regress.sh -s "$(seq -s ' ' 1 20)" -j 8
-./regress.sh -x C -o regress_xprop     # the whole regression with X-propagation
-python3 mutate.py                      # bug-injection campaign (section 4)
-```
+| Time | What happens |
+|---|---|
+| ~45 ns | `rst_n` releases |
+| 96 ns | CPU writes `76D4B2AF` to `0x3B38` (`be=F`). It misses, and `cpu_req_ready` drops: S1 stalls |
+| 115–145 ns | `ST_FILL_REQ`: request for line `0x3B30`. The responder withholds `mem_req_ready` for 2 cycles (backpressure) |
+| 145–206 ns | `ST_FILL_RCV`: random memory latency |
+| 206–276 ns | 4 fill beats `DEAD3B30 … DEAD3B3C` with random gaps, and `mem_rd_last` on the 4th. Never-written memory returns `DEAD` + address, so a beat in the wrong slot is visible |
+| 275 ns | `ST_COMPLETE`: the store is merged into the new line, and `cpu_req_ready` returns |
+| 285–315 ns | Two partial writes (`be=C`) and two reads hit. The reads return `CF26B2AF` and then `787DB2AF`: new upper bytes, old lower bytes |
 
-`xcelium_env.sh` puts `$XCELIUM_HOME/tools.lnx86/bin` on `PATH` when `xrun`
-isn't there already. The default is the UH lab path, so override `XCELIUM_HOME`
-anywhere else. Build options live in `xrun.args`, run-time options in
-`xrun_run.args`. The regression builds once in `regress/`, then runs every
-test/seed from that snapshot with `xrun -R`, each in its own
-`regress/runs/<test>_<seed>/` so parallel runs never share a file. A run
-**passes only if** it reaches the scoreboard report, has `UVM_ERROR 0` /
-`UVM_FATAL 0`, and the simulator printed no `*E`/`*F`. That rule lives in
-`judge.sh`, and `make run` uses it too, so `make` exits non-zero on a failing
-test. Results go to `regress/results.txt`.
-
-Coverage is sampled with `-coverage U`, and each run writes its UCD to
-`regress/runs/<test>_<seed>/cov_work/`, ready for `imc -exec` merging. The lab
-host has no IMC, so `regress.sh` reports the best single run per covergroup.
-Both groups reach 100% in one run (`random_test` for `cache_ops`,
-`stress_test` for `cache_fsm`), so the merged score is 100% too.
-
-> **Known lab-host message.** The host has no `glibc-devel` (`crti.o`, libc
-> headers), so xmelab cannot link the DPI export stub, and xmsim prints
-> `*E,IMPDLL`. Only UVM's interactive Tcl helpers and its C-side error
-> reporting use those exports, so batch results are unaffected.
-> `judge.sh` allows exactly that code (`KNOWN_SIM_ERRORS`). On a host with
-> glibc-devel the message goes away.
->
-> The same host has only 64-bit X11 libraries. A plain `simvision` starts the
-> 32-bit binary and fails with `libX11.so.6: cannot open shared object file`,
-> so use `simvision -64bit` (what `make view` does) or `export
-> CDS_AUTO_64BIT=ALL`. `make GUI=1` already goes through `xrun -64bit`.
-
-### Vivado xsim — Linux / macOS / WSL  (Makefile)
-
-```bash
-cd sim/vivado
-
-# One-time: point at your Vivado install, or source it yourself.
-export VIVADO_ROOT=/opt/Xilinx/Vivado/2025.2     # adjust to your path
-#   (setup_env.sh also probes /tools/Xilinx/... and /opt/Xilinx/... automatically,
-#    and does nothing if you already ran `source .../settings64.sh`)
-
-make                                 # compile + elab + run default test
-make TEST=l1_cache_stress_test SEED=42
-make regress                         # all tests x 4 seeds + merged coverage
-make cov                             # print the merged coverage summary
-make wave                            # rebuild with VCD dumping, then run
-make clean
-
-# or the batch-file-style wrappers:
-./run.sh l1_cache_be_test 7
-./regress.sh
-```
-
-The tools are located by `setup_env.sh` (sourced automatically): it uses xsim
-if it is already on `PATH`, else sources `$VIVADO_ROOT/settings64.sh`, else
-probes common install locations. Vivado's precompiled UVM 1.2 is used via
-`-L uvm` — nothing to compile yourself.
-
-### WSL2 (fast native-filesystem build)
-
-Vivado xsim I/O on the `/mnt/c` 9p mount is slow. Keep editing on Windows, but
-build on the WSL2 native filesystem with the mirror helper — it rsyncs the
-**source only** (no `xsim.dir`/logs) into `~/Pipelined_Cache_Cont` and runs make
-there:
-
-```bash
-cd /mnt/c/Claud_work/Pipelined_Cache_Cont/sim/vivado
-./wsl_local.sh                       # mirror + default test
-./wsl_local.sh regress               # mirror + full regression
-./wsl_local.sh TEST=l1_cache_be_test SEED=7
-```
-
-The `/mnt/c` copy stays the source of truth; `~/Pipelined_Cache_Cont` is a
-throwaway build mirror (override with `export L1_WSL_DIR=~/somewhere`). Needs
-`rsync` (`sudo apt-get install -y rsync`). Source Vivado / set `VIVADO_ROOT`
-exactly as above — `setup_env.sh` runs inside the mirror too.
-
-### Vivado xsim — Windows  (batch)
-
-```bat
-cd sim\vivado
-
-run.bat                              :: default (l1_cache_random_test, seed 1)
-run.bat l1_cache_stress_test 42      :: pick a test and a seed
-regress.bat                          :: all tests x 4 seeds + merged coverage
-```
-
-Set `VIVADO_ROOT` if Vivado is not at `C:\AMDDesignTools\2025.2\Vivado`.
-
-### Common to both
-
-Runtime overrides: `+SEQ=<sequence>`, `+NUM_TRANS=<n>`, `+UVM_TESTNAME=<test>`.
-Waveforms: `make wave` (or `xelab -d DUMP_VCD ...`).
-Cache-internal trace: rebuild with `xelab -d CACHE_DEBUG ...`.
-
-Merged coverage report after a regression:
-`xsim_coverage_report/functionalCoverageReport/xcrg_func_cov_report.txt`
-
-> **Line endings**: all HDL, filelists and shell scripts are committed as LF,
-> enforced by `.gitattributes`. A shell script saved as CRLF fails on Linux with
-> `bad interpreter: /bin/bash^M`; if you ever hit that, run
-> `sed -i 's/\r$//' sim/vivado/*.sh`.
-
-### Tests
-
-| Test | Scenario | funccov |
-|---|---|---|
-| `l1_cache_smoke_test` | short sanity run, gentle memory | ~94% |
-| `l1_cache_random_test` | mixed R/W over 8 tags per 4-way set (default) | 100% |
-| `l1_cache_thrash_test` | whole-address-space random, everything misses | 83.9% |
-| `l1_cache_eviction_test` | 6 tags per set — continuous PLRU eviction | 98.2% |
-| `l1_cache_b2b_test` | true back-to-back, VALID never drops | 90.5% |
-| `l1_cache_line_test` | multi-word line / spatial locality | ~79% |
-| `l1_cache_be_test` | byte enables + per-byte forwarding | ~88% |
-| `l1_cache_stress_test` | slow memory + heavy backpressure both channels | 100% |
-| `l1_cache_passive_test` | passive CPU agent, BFM-driven stimulus | 57.1% |
-| `l1_cache_reset_test` | mid-traffic reset, bus quiesced first | 100% |
-| `l1_cache_reset_async_test` | reset at an arbitrary moment, incl. mid-burst | 100% |
-
-Per-test numbers are low by design — each targets a narrow scenario. **The
-merged number across the regression is 100%**, produced by `xcrg`.
+Every following group repeats this for a new address (`0xED64`, `0x54B4`, …).
+The cache is still cold here, so every victim is an invalid way and
+`mem_wr_*` never moves. Write-backs appear later, once sets fill up.
 
 ---
 
-## 4. Mutation campaign — does the testbench catch bugs?
+## 4. Does the testbench catch bugs?
 
-100% coverage says the stimulus *reached* every scenario. It does not say a bug
-in that scenario would be *noticed*. `sim/xcelium/mutate.py` measures that
-directly. It injects one deliberate RTL defect at a time (an exact text
-substitution in a copy of `rtl/`), rebuilds, and reruns the regression until the
-first failing run. An unmutated baseline runs first and must pass.
+`sim/xcelium/mutate.py` injects one deliberate defect at a time into a copy of
+`rtl/`, rebuilds it, and reruns the regression until the first failing run. An
+unmutated baseline must pass first. Runs stopped by tool trouble (license,
+wall-clock limit) are reported as `ERROR`, not counted as kills.
 
-32 mutants: 28 in the controller (forwarding, hit/victim logic, dirty/PLRU
-bookkeeping, write-back sequencing, burst framing, byte enables, stall, reset)
-and 4 in `l1_cache_pkg` (PLRU and address-split helpers). The whole campaign
-takes about 100 s, 4 mutants at a time.
+There are 32 mutants. 28 are in the controller: forwarding, hit and victim
+logic, dirty and PLRU bookkeeping, write-back sequencing, burst framing, byte
+enables, stall and reset. 4 are in `l1_cache_pkg`, the PLRU and address-split
+helpers. A campaign takes about 100 s.
 
 | | first campaign | after the fix |
 |---|---|---|
 | killed | 28 | **31** |
-| survived | 3 (P01, P02, P04) | 0 |
-| equivalent | 1 (C08) | 1 (C08) |
+| survived | 3 — P01, P02, P04 | 0 |
+| equivalent | 1 — C08 | 1 — C08 |
 | score | 90.3% | **100%** |
 
-**What the survivors showed.** P01, P02 and P04 all live in `l1_cache_pkg`, and
-the scoreboard used to call the same `plru_update` / `plru_victim` / `get_word`
-as the RTL. A bug there lands in the DUT and the model together, so they agree
-and every check passes. P04 is the bad one: words 0 and 1 of a line alias, so
-**stored data is lost, and every test still passed at 100% coverage**. The fix
-was to make the model independent (spec-derived decode and PLRU), and to add the
-flat-memory architectural check described in section 2. P04 now fails with both
-`READ_DATA_BUG` and `ARCH_DATA_BUG` (20 of each in the smoke test).
+**The survivors were a common-mode blind spot.** P01, P02 and P04 are bugs in
+`l1_cache_pkg`, and the scoreboard used to call the same `plru_update`,
+`plru_victim` and `get_word` as the RTL. The bug landed in the DUT and the model
+together, so they agreed. P04 makes words 0 and 1 of a line alias: **stored data
+is lost, and every test still passed at 100% coverage.** The fix was the
+spec-derived model and the architectural check described in section 2. P04 now
+fails with both `READ_DATA_BUG` and `ARCH_DATA_BUG`.
 
-**C08 is equivalent, not missed.** "Fill the highest invalid way first" is the
-relabelling way *w* ↔ 3−*w*, and tree-PLRU is symmetric under it (swap the pairs
-and the ways inside them). The PLRU bits are all rewritten before any victim
-decision reads them, so every hit, miss, victim line and write-back is
-identical. Way numbers never reach the pins. It still runs in every campaign, so
-if it ever dies the reasoning is wrong.
+**C08 is equivalent, not missed.** "Fill the highest invalid way first" swaps
+way *w* with 3−*w*. Tree-PLRU is symmetric under that swap, and every PLRU bit
+is rewritten before a victim decision reads it. So hits, misses, victim lines
+and write-backs are identical, and way numbers never reach the pins. It still
+runs in every campaign, so if it ever dies, the reasoning is wrong.
 
-First check to fire: `READ_DATA_BUG` 11, `MEM_ADDR` 8, `MEM_DIRECTION` 4,
-`MEM_UNEXPECTED` 3, `WRITE_BACK_BUG` 2, `MEM_LEN` 1, `MEM_DRV` 1, `MON_SYNC` 1.
-C23 and C24 also deadlock the FSM afterwards. The 5 ms UVM timeout ends those
-runs in about a second instead of leaving them to the 600 s wall-clock limit.
-The full table is written to `sim/xcelium/mutants/report.md`.
+First check to fire, across the 31 kills:
+
+| Check | Kills |
+|---|---|
+| `READ_DATA_BUG` | 11 |
+| `MEM_ADDR` | 8 |
+| `MEM_DIRECTION` | 4 |
+| `MEM_UNEXPECTED` | 3 |
+| `WRITE_BACK_BUG` | 2 |
+| `MEM_LEN` | 1 |
+| `MEM_DRV` | 1 |
+| `MON_SYNC` | 1 |
 
 ---
 
-## 5. History — what was wrong, and what changed
+## 5. Running it
 
-### Xcelium port
+### Cadence Xcelium (`sim/xcelium`)
 
-| Fix | Detail |
+```bash
+cd sim/xcelium
+
+make                                    # build + run l1_cache_random_test, seed 1
+make TEST=l1_cache_stress_test SEED=42
+make XPROP=C                            # X-propagation build
+make WAVE=1 && make view                # dump waves.shm, open it in SimVision
+make GUI=1                              # interactive SimVision
+make PLUSARGS="+NUM_TRANS=500 +SEQ=l1_cache_rand_seq"
+
+./regress.sh                            # 11 tests x 4 seeds, 4 runs in parallel
+./regress.sh -s "$(seq -s ' ' 1 20)" -j 8
+./regress.sh -x C -o regress_xprop      # whole regression with X-propagation
+python3 mutate.py                       # bug-injection campaign
+```
+
+| File | Role |
 |---|---|
-| **Package constants missing from the published copy** | `ADDR_WIDTH`, `DATA_WIDTH`, `BE_WIDTH` and `WAYS` had dropped out of `l1_cache_pkg.sv` along with a comment block, so the repository did not compile on any simulator. Restored. |
-| **Scoreboard shared the DUT's helpers** | found by the mutation campaign (section 4): three package bugs, including one that loses stored data, passed everything. The model is now independent, and a flat-memory architectural check was added. |
-| **FSM transition coverage across reset** | xsim passed the reset tests, but Xcelium raised `*E,EILLTB` (illegal `ST_FILL_RCV => ST_IDLE`) in all 8 runs. The `iff (rst_n)` gate joins the samples on either side of a mid-miss reset. Now covered on a reset-cleared `{prev_state, state}` pair. |
-| **No simulation timeout** | a deadlocked DUT would have run until UVM's 9200 s default. Now `set_timeout(5ms)`, against a longest test of ~270 µs. Two mutants deadlock the FSM, and this is what ends their runs. |
-| **Covergroups not sampled** | Xcelium samples covergroups only with `-coverage U`; without it every `get_coverage()` returned 0 and the run still passed. |
-| **Cover directives counted once** | Xcelium retires a `cover property` after its first hit by default; `-abvfinishlimit` keeps them counting, and the counts are now printed. |
-| **X-propagation** | the full regression passes with `-xprop C`, and every RTL block is X-prop enabled (only UVM library blocks are excluded). |
+| `xrun.args` / `xrun_run.args` | build options / run-time options, written once |
+| `regress.sh` | builds once, then runs each test/seed from the snapshot in its own `regress/runs/<test>_<seed>/` |
+| `judge.sh` | the pass rule, shared with `make run`: the run reached the scoreboard report, `UVM_ERROR 0`, `UVM_FATAL 0`, and no simulator `*E`/`*F` |
+| `mutate.py` | the mutant catalogue and campaign runner; writes `mutants/report.md` |
+| `view.tcl` | SimVision layout used by `make view` |
 
-### RTL
+Each run writes a UCD to `regress/runs/<test>_<seed>/cov_work/`, ready for an
+IMC merge. `regress.sh` prints the best single run per covergroup. Both reach
+100% in one run, so the merged score is 100% too.
 
-| Fix | Detail |
-|---|---|
-| **Combinational loop removed** | `pipeline_stall → tag_raddr → tag_rdata → cache_hit → pipeline_stall` was a closed loop. Broken by making the array read port registered. |
-| **SRAM read model** | `assign rdata = mem[raddr]` (combinational) contradicted the S1-addressed pipeline. Root cause of 675 read mismatches: on the allocate→hit turnaround the core read the *next* request's index and returned another line's data. |
-| **Data-array forwarding added** | the tag array already had it; the data array needed the same, and now needs it **per byte**. |
-| **Cache line geometry** | was `tag[31:12]/index[11:4]` (a 16-byte line) while the data array held one word per line, so `0x100` and `0x104` aliased onto the same tag+index. |
-| **Direct-mapped → 4-way + PLRU** | one line per set meant any two hot addresses sharing an index thrashed permanently. |
-| **1-word → 4-word lines, burst fill/evict** | the memory interface now carries real bursts with a beat count and `LAST`. |
-| **Byte enables** | writes could only replace a whole word. |
-| **Single-shot memory requests** | `mem_req_valid` stayed asserted for the whole allocate latency, so the memory model saw the same request repeatedly. |
-| **Power-on flush** | the tag array powered up as X and hit/miss was decided with non-synthesisable `===`. valid/dirty now live in flops and reset clears them in one cycle. |
-| **1-entry "vault" removed** | it forced `cache_hit=1` without checking the tag, so a read could hit on stale data after that line was evicted. It only existed to paper over the addressing bug. |
-| **`always_comb` declaration initialisers** | `logic x = 0;` inside a procedural block is *static* — the initialiser runs once at time 0, not per evaluation. Rewritten as plain assignments. |
+<details>
+<summary>Notes for the UH lab host (msd-10)</summary>
 
-### Testbench
+- `xcelium_env.sh` adds `/usr/local/cadence/XCELIUM2409/tools.lnx86/bin` to
+  `PATH`. Set `XCELIUM_HOME` to use another install.
+- Every tool needs `-64bit`. The 32-bit libz and libX11 are missing, and
+  `make view` / `make GUI=1` already pass the flag. `export
+  CDS_AUTO_64BIT=ALL` makes it the default for every Cadence tool.
+- There is no `glibc-devel`, so the DPI export stub cannot be linked and
+  xmsim prints `*E,IMPDLL`. Batch results are unaffected, and `judge.sh`
+  allows exactly that code.
+- There is no IMC on the host, so UCDs cannot be merged or reported there.
 
-| Fix | Detail |
-|---|---|
-| **SVA failures were invisible to the regression** | assertions used `$error`, which does **not** increment `UVM_ERROR`, so a run with failing assertions still reported `UVM_ERROR : 0` and passed. They now call `uvm_report_error`, and this was confirmed with a deliberately-failing assertion (685 errors, run correctly flagged FAIL). |
-| **Merged coverage exists after all** | an earlier note in this file claimed xsim cannot merge functional coverage. It can: `xsim -cov_db_name` per run, then `xcrg -merge_db_name`. Now wired into `regress.bat`. |
-| **Golden model became a cache model** | the scoreboard modelled only main memory; it could not tell "this should have been a hit" from "this should have missed", nor predict which way, nor check fill data. |
-| **Scoreboard ordering** | expected read data is snapshot at issue time. Was causing ~2 false failures per run. |
-| **Functional coverage was dead code** | `l1_cache_coverage.sv` existed but was never included, built, connected or sampled — coverage was effectively 0%. |
-| **Constrained randomisation** | every sequence assigned fields by hand (a workaround for a Questa FSE licence limit that no longer applies on xsim). |
-| **Memory latency + backpressure** | the responder was hardwired zero-latency and permanently ready; `latency` was declared with a 10–50 cycle constraint that nothing used. |
-| **Two dead assertions revived** | `p_valid_hold` and `p_payload_stable` keyed off a `pipeline_stall` signal declared in the interface but never driven — it sat at `'z`, so both passed vacuously forever. |
-| **Clocking blocks** | drivers and monitors sampled with `@(posedge clk); #1ps;` (post-edge). |
-| **True back-to-back** | the driver dropped VALID after every item, so `l1_cache_b2b_seq` was not actually back-to-back. |
-| **`disable fork` corrupted the sequencer** | the memory driver's reset handling killed the task between `get_next_item` and `item_done`, producing "Get_next_item called twice" and later "item_done() with no outstanding requests". `disable fork` also terminates processes the sequencer spawns; replaced with explicit abort checks at every wait point. |
-| **Loop-body declaration initialisers** | `bit [31:0] base = f(i);` inside a `for` body was evaluated **once** by xsim, silently collapsing 24 distinct cache lines into 1 (the passive test reported 191 hits / 1 miss and still "passed"). All such declarations are now split from their assignment. |
-| **Helper argument names** | `get_index(a)` / `make_addr(t, i)` used single-letter formals. When a call site had a local with the same name, xsim evaluated the actual argument in the callee's scope and silently passed 0 — this made `l1_cache_eviction_test` generate zero evictions while still passing. |
-| **Config object + test hierarchy** | one test with the sequence chosen by commenting lines in and out → `l1_cache_config` plus a base test and eleven scenario tests. |
-| **`check_phase` added** | fails on zero traffic, dangling reads, unfulfilled memory predictions, or any mismatch — a silent testbench no longer looks like a pass. |
-| **Passive mode is now exercised** | the CPU agent could be built passive but nothing ever ran it, so the monitor was free to grow a hidden dependency on the driver. `l1_cache_passive_test` builds the agent passive and drives the pins from a BFM in the test. |
-| **Build scripts** | `files.f`, `run.bat`, `regress.bat` — the build used to be entirely manual. |
+</details>
+
+### Vivado xsim (`sim/vivado`)
+
+The original flow (Vivado 2025.2, built-in UVM 1.2) is kept as it was. It last
+passed 44/44 with 100% merged coverage (`xcrg`) before the Xcelium port. It has
+not been re-run since the checker changes above.
+
+```bash
+cd sim/vivado && make regress           # Linux / WSL (set VIVADO_ROOT if needed)
+```
+```bat
+cd sim\vivado && regress.bat            :: Windows
+```
 
 ---
 
-## 6. Not done yet
+## 6. Tests
 
-**Verification**
+| Test | Scenario | `cache_ops` | `cache_fsm` |
+|---|---|---|---|
+| `l1_cache_smoke_test` | short run, gentle memory | 87–95% | 89–91% |
+| `l1_cache_random_test` | mixed R/W over 8 tags per 4-way set (default) | 100% | 97.7% |
+| `l1_cache_thrash_test` | whole-address-space random, nearly all misses | 83.9% | 84.1% |
+| `l1_cache_eviction_test` | 6 tags per set, continuous PLRU eviction | 94.6% | 97.7% |
+| `l1_cache_b2b_test` | back-to-back, VALID never drops | 89–90% | 97.7% |
+| `l1_cache_line_test` | walk every word of a line after a fill | 68–79% | 77–98% |
+| `l1_cache_be_test` | byte enables and per-byte forwarding | 86–88% | 97.7% |
+| `l1_cache_stress_test` | slow memory, heavy backpressure on both channels | 100% | 100% |
+| `l1_cache_passive_test` | passive CPU agent, pins driven by a BFM | 57.1% | 61–64% |
+| `l1_cache_reset_test` | resets mid-traffic, bus idle first | 100% | 97.7% |
+| `l1_cache_reset_async_test` | resets at any moment, including mid-burst | 100% | 97.7% |
 
-* **No register model / RAL.** This is not an oversight to fix with a RAL: the
-  DUT has no memory-mapped registers, so there is nothing for a register model
-  to abstract. Making RAL meaningful means first adding a CSR block (cache
-  enable, software flush, hit/miss performance counters) — a design change, not
-  a testbench one. Worth doing; inventing registers purely to demonstrate the
-  technique is not.
-* **Async reset poisons a small number of lines.** When reset cuts a write-back
-  burst in half, DRAM for that line is genuinely unpredictable, so data checks
-  for it are skipped for the rest of the run. Bounded (≤1 line per reset) and
-  reported. Recovering full checking would mean having the model adopt the
-  observed fill data for poisoned lines.
-* **Code coverage is not reported.** Xcelium can collect it
-  (`-coverage all -covdut l1_cache_top`), but the lab host has no IMC to merge
-  and report the UCDs. On xsim, `xelab -cc` plus `xcrg` would do it.
-* **No gate-level run and no formal property checking.** X-propagation is done
-  (`regress.sh -x C`). The SVA in `l1_cache_if.sv` are written so that a formal
-  tool could take them as-is.
-* **Mutation is single-site and hand-written.** The 32 mutants are chosen by
-  hand. An automatic operator-based mutator (Certitude-style) would also probe
-  the corners nobody thought to write down.
+Ranges are over seeds 1, 7, 42 and 999 on Xcelium. Each test targets a narrow
+scenario, so per-test numbers are low by design.
 
-**Architecture**
+---
 
-* **Non-blocking misses (MSHR).** The biggest remaining item, and deliberately
-  deferred rather than half-done: hit-under-miss means read responses stop
-  being in program order, which invalidates the monitor's queue-based response
-  matching and the scoreboard's in-order snapshot. It needs response IDs on the
-  CPU interface and an ID-matching scoreboard — a testbench redesign as much as
-  an RTL one.
-* Configurable ways/sets/line size via parameters rather than package
-  localparams.
-* Critical-word-first fill (return the requested word to the CPU on the beat it
-  arrives, instead of waiting for `ST_COMPLETE`).
-* A store that covers an entire line could skip the fetch. With 16-byte lines
-  and word-sized stores this never happens, so it is only worth doing alongside
-  wider stores or per-word dirty bits.
-* Write buffer, so a dirty eviction does not serialise in front of the fill.
+## 7. Bugs found along the way
+
+**Found on Xcelium and by bug injection**
+
+| Issue | Detail |
+|---|---|
+| Scoreboard shared the DUT's helpers | three package bugs, one of which loses data, passed everything. The model is now independent, and the architectural check was added |
+| Illegal FSM transition across reset | Xcelium raised `*E,EILLTB` in every reset test, which xsim had passed. `iff (rst_n)`-gated `=>` bins joined samples across the reset. Fixed with a reset-cleared `{prev_state, state}` pair |
+| Covergroups not sampled | Without `-coverage U`, Xcelium reports 0% coverage, and the run still passed |
+| No simulation timeout | A deadlocked DUT would run until UVM's 9200 s default. Now 5 ms by default; `+UVM_TIMEOUT` still overrides it |
+| Published copy didn't compile | four `l1_cache_pkg` constants were missing |
+
+<details>
+<summary>Earlier fixes (xsim era)</summary>
+
+**RTL**
+
+- **Combinational loop.** `stall → raddr → rdata → hit → stall` was removed by
+  making the SRAM read port registered.
+- **Combinational SRAM model.** It made the core read the *next* request's
+  index on an allocate→hit turnaround, causing 675 read mismatches.
+- **Data-array forwarding** was added, and later made per byte.
+- **Line geometry.** The tag/index split described a 16-byte line while the
+  array held one word, so `0x100` and `0x104` aliased.
+- **Architecture.** Went from direct-mapped to 4-way with PLRU, from 1-word
+  lines to 4-word burst lines, and added byte enables.
+- **Memory request.** It stayed asserted for the whole miss and was seen as
+  repeated requests.
+- **"Vault" entry.** It forced a hit without checking the tag and was removed.
+- **Power-on X.** Fixed by moving valid/dirty into flops.
+- **`always_comb` declaration initialisers** were static and ran once.
+
+**Testbench**
+
+- **`$error` in SVA** did not increment `UVM_ERROR`, so failing assertions
+  passed. Assertions now use `uvm_report_error`, confirmed with a deliberately
+  failing assertion.
+- **Coverage was dead code.** It was never built or sampled.
+- **The scoreboard only modelled memory.** It was rebuilt as a full cache
+  model with issue-time snapshots.
+- **Memory responder** was zero-latency and always ready; it now has random
+  latency, backpressure and beat gaps.
+- **Two assertions keyed off an undriven signal** and passed vacuously.
+- **The b2b driver** dropped VALID between items, so back-to-back traffic
+  wasn't really back-to-back.
+- **`disable fork` in the memory driver** corrupted the sequencer handshake.
+- **Loop-body declaration initialisers** were evaluated once by xsim, which
+  collapsed 24 lines into 1.
+- **Single-letter helper formals** shadowed call-site locals and silently
+  passed 0.
+- **Added** a config object, a test hierarchy, `check_phase`, a passive-mode
+  test and clocking blocks.
+
+</details>
+
+---
+
+## 8. Limitations and next steps
+
+- **Non-blocking misses (MSHR).** This is the largest remaining item.
+  Hit-under-miss returns reads out of program order, so it needs response IDs
+  on the CPU port and an ID-matching scoreboard.
+- **No RAL.** The DUT has no registers. A CSR block (enable, flush,
+  hit/miss counters) would make a register model meaningful.
+- **Code coverage is collected but not reported.** That needs IMC. There is
+  also no gate-level run and no formal run, although the SVA are written so a
+  formal tool could take them as-is.
+- **Async reset poisons at most one line per reset.** Adopting the observed
+  fill data would restore full checking.
+- **The mutants are hand-written and single-site.** An operator-based mutator
+  would explore corners nobody listed.
+- **Smaller items:** parameterised geometry, critical-word-first fill, and a
+  write buffer.
