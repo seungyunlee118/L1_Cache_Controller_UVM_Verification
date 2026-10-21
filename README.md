@@ -217,7 +217,8 @@ cd sim/xcelium
 make                                   # build + run the default test
 make TEST=l1_cache_stress_test SEED=42
 make XPROP=C                           # X-propagation build (CAT; F for FOX)
-make WAVE=1                            # SHM dump -> waves.shm  (simvision waves.shm)
+make WAVE=1                            # SHM dump -> waves.shm
+make view                              # open it: simvision -64bit waves.shm
 make GUI=1                             # interactive SimVision
 make PLUSARGS="+NUM_TRANS=500 +SEQ=l1_cache_rand_seq"
 
@@ -247,6 +248,11 @@ Both groups reach 100% in one run (`random_test` for `cache_ops`,
 > reporting use those exports, so batch results are unaffected.
 > `regress.sh` allows exactly that code (`KNOWN_SIM_ERRORS`). On a host with
 > glibc-devel the message goes away.
+>
+> The same host has only 64-bit X11 libraries. A plain `simvision` starts the
+> 32-bit binary and fails with `libX11.so.6: cannot open shared object file`,
+> so use `simvision -64bit` (what `make view` does) or `export
+> CDS_AUTO_64BIT=ALL`. `make GUI=1` already goes through `xrun -64bit`.
 
 ### Vivado xsim — Linux / macOS / WSL  (Makefile)
 
