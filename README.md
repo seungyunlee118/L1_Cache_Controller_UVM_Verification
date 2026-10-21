@@ -9,13 +9,18 @@ stimulus, a reactive burst memory responder with variable latency and
 backpressure on both channels, a reset agent, SVA, and functional + white-box
 FSM coverage merged across the regression.
 
-Simulator: **Vivado xsim 2025.2** (built-in UVM 1.2).
+Simulators: **Cadence Xcelium 24.09** (CDNS UVM 1.2) and **Vivado xsim 2025.2**
+(built-in UVM 1.2).
 
 ```
-regress.bat  ->  44/44 pass  (11 tests x 4 seeds)
-                 UVM_ERROR 0, UVM_FATAL 0, SVA failures 0
-                 merged functional coverage : 100%
-                 FSM coverage               : 100% (stress test), >=97.5% elsewhere
+Xcelium  regress.sh       ->  44/44 pass  (11 tests x 4 seeds), 21 s
+         regress.sh -x C  ->  44/44 pass  with X-propagation (CAT mode on all RTL)
+         20-seed sweep    ->  220/220 pass
+                              UVM_ERROR 0, UVM_FATAL 0, SVA failures 0
+                              cache_ops coverage : 100%   cache_fsm coverage : 100%
+         mutate.py        ->  31/31 injected RTL bugs killed (+1 provably equivalent)
+
+xsim     regress.bat      ->  44/44 pass, merged functional coverage 100% (xcrg)
 ```
 
 ---
@@ -49,9 +54,11 @@ regress.bat  ->  44/44 pass  (11 tests x 4 seeds)
 | Memory | burst: request + separate write-data and read-data channels, 4 beats |
 | Latency | read hit = 1 cycle; miss = fill (+ write-back if the victim is dirty) |
 
-The address split lives in **one place** — `get_set()` / `get_tag()` /
-`get_word()` / `make_line_addr()` in `rtl/l1_cache_pkg.sv` — and both the RTL and
-the testbench use those helpers, so the two can never drift apart.
+The RTL's address split lives in one place — `get_set()` / `get_tag()` /
+`get_word()` / `make_line_addr()` in `rtl/l1_cache_pkg.sv`. Stimulus may use
+those helpers, but the **scoreboard deliberately does not**: it decodes
+addresses and runs its own tree-PLRU straight from the spec. Sharing them made a
+bug in the package invisible — see [§4](#4-mutation-campaign--does-the-testbench-catch-bugs).
 
 ### FSM
 
@@ -122,6 +129,19 @@ it must carry. Observed memory traffic is checked against that prediction **in
 order**, so a spurious, missing, mis-addressed, mis-ordered or wrong-length
 burst fails the test.
 
+The model is written from the spec (`addr[9:4]` is the set, a 3-node PLRU tree
+per set), not by calling the RTL's package functions, and a build-phase check
+stops the run if the package geometry ever stops matching it.
+
+Every read is also checked a second way, against an **architectural flat
+memory** that knows nothing about caching: each store lands in it at once, and a
+load must return the last value stored to that address. A cache is supposed to be
+invisible, so this check holds no matter what the ways, victims and write-backs
+look like. It is the check that still works if the cache model and the DUT ever
+share a mistake (`ARCH_DATA_BUG`, reported separately from `READ_DATA_BUG`).
+After a reset it restarts from the predicted DRAM contents, because reset
+discards dirty lines.
+
 ### Ordering
 
 The CPU monitor publishes on **two** analysis ports: `req_ap` (every accepted
@@ -165,18 +185,79 @@ flavours:
 Coverage is fed from the **scoreboard**, not the monitor — hit/miss, way and
 victim state only exist in the reference model, not on the pins.
 
+FSM transitions are covered on an explicit `{prev_state, state}` pair, with
+`prev_state` cleared by the same reset as the FSM. Plain `=>` transition bins
+don't work here. The covergroup is gated off during reset, so the last sample
+before a reset and the first one after it look consecutive: a reset in the
+middle of a miss then registers as the illegal `ST_FILL_RCV => ST_IDLE`.
+Xcelium flagged exactly that (`*E,EILLTB`) in every reset test.
+
 Assertions live in `tb/l1_cache_if.sv`: handshake hold, payload stability, X/Z
 checks on every channel, line alignment, and **burst beat accounting** (each
 burst must deliver exactly `len+1` beats with `LAST` on the final one).
 
+Each `cover property` counts its hits in its pass action, and the counts are
+printed as `[SVA COVER] ...` at the end of the run. That way they are visible
+without a coverage viewer, and as a side effect the dirty-eviction count from
+the cover matches the scoreboard's exactly (470 for `random_test` seed 1).
+
 > xsim ignores `cover property` (it prints `XSIM 43-4127` at elaboration).
-> Those cover statements are still valid and collect in Questa.
+> Xcelium retires a cover after its first hit unless `-abvfinishlimit` is
+> raised, which `xrun.args` does.
 
 ---
 
 ## 3. Running
 
-### Linux / macOS / WSL  (Makefile)
+### Cadence Xcelium  (`sim/xcelium`)
+
+```bash
+cd sim/xcelium
+
+make                                   # build + run the default test
+make TEST=l1_cache_stress_test SEED=42
+make XPROP=C                           # X-propagation build (CAT; F for FOX)
+make WAVE=1                            # SHM dump -> waves.shm
+make view                              # open it with the view.tcl signal layout
+make GUI=1                             # interactive SimVision
+make PLUSARGS="+NUM_TRANS=500 +SEQ=l1_cache_rand_seq"
+
+./regress.sh                           # 11 tests x 4 seeds, 4 runs in parallel
+./regress.sh -s "$(seq -s ' ' 1 20)" -j 8
+./regress.sh -x C -o regress_xprop     # the whole regression with X-propagation
+python3 mutate.py                      # bug-injection campaign (section 4)
+```
+
+`xcelium_env.sh` puts `$XCELIUM_HOME/tools.lnx86/bin` on `PATH` when `xrun`
+isn't there already. The default is the UH lab path, so override `XCELIUM_HOME`
+anywhere else. Build options live in `xrun.args`, run-time options in
+`xrun_run.args`. The regression builds once in `regress/`, then runs every
+test/seed from that snapshot with `xrun -R`, each in its own
+`regress/runs/<test>_<seed>/` so parallel runs never share a file. A run
+**passes only if** it reaches the scoreboard report, has `UVM_ERROR 0` /
+`UVM_FATAL 0`, and the simulator printed no `*E`/`*F`. That rule lives in
+`judge.sh`, and `make run` uses it too, so `make` exits non-zero on a failing
+test. Results go to `regress/results.txt`.
+
+Coverage is sampled with `-coverage U`, and each run writes its UCD to
+`regress/runs/<test>_<seed>/cov_work/`, ready for `imc -exec` merging. The lab
+host has no IMC, so `regress.sh` reports the best single run per covergroup.
+Both groups reach 100% in one run (`random_test` for `cache_ops`,
+`stress_test` for `cache_fsm`), so the merged score is 100% too.
+
+> **Known lab-host message.** The host has no `glibc-devel` (`crti.o`, libc
+> headers), so xmelab cannot link the DPI export stub, and xmsim prints
+> `*E,IMPDLL`. Only UVM's interactive Tcl helpers and its C-side error
+> reporting use those exports, so batch results are unaffected.
+> `judge.sh` allows exactly that code (`KNOWN_SIM_ERRORS`). On a host with
+> glibc-devel the message goes away.
+>
+> The same host has only 64-bit X11 libraries. A plain `simvision` starts the
+> 32-bit binary and fails with `libX11.so.6: cannot open shared object file`,
+> so use `simvision -64bit` (what `make view` does) or `export
+> CDS_AUTO_64BIT=ALL`. `make GUI=1` already goes through `xrun -64bit`.
+
+### Vivado xsim — Linux / macOS / WSL  (Makefile)
 
 ```bash
 cd sim/vivado
@@ -222,7 +303,7 @@ throwaway build mirror (override with `export L1_WSL_DIR=~/somewhere`). Needs
 `rsync` (`sudo apt-get install -y rsync`). Source Vivado / set `VIVADO_ROOT`
 exactly as above — `setup_env.sh` runs inside the mirror too.
 
-### Windows  (batch)
+### Vivado xsim — Windows  (batch)
 
 ```bat
 cd sim\vivado
@@ -269,7 +350,63 @@ merged number across the regression is 100%**, produced by `xcrg`.
 
 ---
 
-## 4. History — what was wrong, and what changed
+## 4. Mutation campaign — does the testbench catch bugs?
+
+100% coverage says the stimulus *reached* every scenario. It does not say a bug
+in that scenario would be *noticed*. `sim/xcelium/mutate.py` measures that
+directly. It injects one deliberate RTL defect at a time (an exact text
+substitution in a copy of `rtl/`), rebuilds, and reruns the regression until the
+first failing run. An unmutated baseline runs first and must pass.
+
+32 mutants: 28 in the controller (forwarding, hit/victim logic, dirty/PLRU
+bookkeeping, write-back sequencing, burst framing, byte enables, stall, reset)
+and 4 in `l1_cache_pkg` (PLRU and address-split helpers). The whole campaign
+takes about 100 s, 4 mutants at a time.
+
+| | first campaign | after the fix |
+|---|---|---|
+| killed | 28 | **31** |
+| survived | 3 (P01, P02, P04) | 0 |
+| equivalent | 1 (C08) | 1 (C08) |
+| score | 90.3% | **100%** |
+
+**What the survivors showed.** P01, P02 and P04 all live in `l1_cache_pkg`, and
+the scoreboard used to call the same `plru_update` / `plru_victim` / `get_word`
+as the RTL. A bug there lands in the DUT and the model together, so they agree
+and every check passes. P04 is the bad one: words 0 and 1 of a line alias, so
+**stored data is lost, and every test still passed at 100% coverage**. The fix
+was to make the model independent (spec-derived decode and PLRU), and to add the
+flat-memory architectural check described in section 2. P04 now fails with both
+`READ_DATA_BUG` and `ARCH_DATA_BUG` (20 of each in the smoke test).
+
+**C08 is equivalent, not missed.** "Fill the highest invalid way first" is the
+relabelling way *w* ↔ 3−*w*, and tree-PLRU is symmetric under it (swap the pairs
+and the ways inside them). The PLRU bits are all rewritten before any victim
+decision reads them, so every hit, miss, victim line and write-back is
+identical. Way numbers never reach the pins. It still runs in every campaign, so
+if it ever dies the reasoning is wrong.
+
+First check to fire: `READ_DATA_BUG` 11, `MEM_ADDR` 8, `MEM_DIRECTION` 4,
+`MEM_UNEXPECTED` 3, `WRITE_BACK_BUG` 2, `MEM_LEN` 1, `MEM_DRV` 1, `MON_SYNC` 1.
+C23 and C24 also deadlock the FSM afterwards. The 5 ms UVM timeout ends those
+runs in about a second instead of leaving them to the 600 s wall-clock limit.
+The full table is written to `sim/xcelium/mutants/report.md`.
+
+---
+
+## 5. History — what was wrong, and what changed
+
+### Xcelium port
+
+| Fix | Detail |
+|---|---|
+| **Package constants missing from the published copy** | `ADDR_WIDTH`, `DATA_WIDTH`, `BE_WIDTH` and `WAYS` had dropped out of `l1_cache_pkg.sv` along with a comment block, so the repository did not compile on any simulator. Restored. |
+| **Scoreboard shared the DUT's helpers** | found by the mutation campaign (section 4): three package bugs, including one that loses stored data, passed everything. The model is now independent, and a flat-memory architectural check was added. |
+| **FSM transition coverage across reset** | xsim passed the reset tests, but Xcelium raised `*E,EILLTB` (illegal `ST_FILL_RCV => ST_IDLE`) in all 8 runs. The `iff (rst_n)` gate joins the samples on either side of a mid-miss reset. Now covered on a reset-cleared `{prev_state, state}` pair. |
+| **No simulation timeout** | a deadlocked DUT would have run until UVM's 9200 s default. Now `set_timeout(5ms)`, against a longest test of ~270 µs. Two mutants deadlock the FSM, and this is what ends their runs. |
+| **Covergroups not sampled** | Xcelium samples covergroups only with `-coverage U`; without it every `get_coverage()` returned 0 and the run still passed. |
+| **Cover directives counted once** | Xcelium retires a `cover property` after its first hit by default; `-abvfinishlimit` keeps them counting, and the counts are now printed. |
+| **X-propagation** | the full regression passes with `-xprop C`, and every RTL block is X-prop enabled (only UVM library blocks are excluded). |
 
 ### RTL
 
@@ -311,7 +448,7 @@ merged number across the regression is 100%**, produced by `xcrg`.
 
 ---
 
-## 5. Not done yet
+## 6. Not done yet
 
 **Verification**
 
@@ -326,9 +463,15 @@ merged number across the regression is 100%**, produced by `xcrg`.
   for it are skipped for the rest of the run. Bounded (≤1 line per reset) and
   reported. Recovering full checking would mean having the model adopt the
   observed fill data for poisoned lines.
-* **Code coverage is not collected.** `xelab -cc` plus `xcrg` would give
-  statement/branch/toggle numbers alongside the functional ones.
-* **No X-propagation or gate-level run**, and no formal property checking.
+* **Code coverage is not reported.** Xcelium can collect it
+  (`-coverage all -covdut l1_cache_top`), but the lab host has no IMC to merge
+  and report the UCDs. On xsim, `xelab -cc` plus `xcrg` would do it.
+* **No gate-level run and no formal property checking.** X-propagation is done
+  (`regress.sh -x C`). The SVA in `l1_cache_if.sv` are written so that a formal
+  tool could take them as-is.
+* **Mutation is single-site and hand-written.** The 32 mutants are chosen by
+  hand. An automatic operator-based mutator (Certitude-style) would also probe
+  the corners nobody thought to write down.
 
 **Architecture**
 

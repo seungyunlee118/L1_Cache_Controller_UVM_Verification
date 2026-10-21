@@ -1,0 +1,21 @@
+// ---------------------------------------------------------------------------
+// Build options shared by every xrun build (Makefile, regress.sh, mutate.py).
+// Run-time options live in xrun_run.args, included here.
+// ---------------------------------------------------------------------------
+
+-F xrun_run.args
+
+-uvm -uvmhome CDNS-1.2
+-sv
+-timescale 1ns/1ps
+-top tb_top
+
+// Covergroups are only sampled when functional coverage is enabled.
+// Each run writes its UCD under cov_work/scope/<covtest>/ for IMC merging.
+-coverage U
+
+// CGPIDF: per_instance default reminder - the covergroups set it explicitly.
+// DPIEXP: the DPI export stub cannot be linked on a host without glibc-devel
+//         (see KNOWN_SIM_ERRORS in regress.sh); harmless in batch runs.
+-nowarn CGPIDF
+-nowarn DPIEXP

@@ -1,0 +1,39 @@
+# Vivado / xsim
+xsim.dir/
+xsim.covdb/
+xsim.codeCov/
+xsim_coverage_report/
+*.jou
+*.pb
+*.wdb
+*.str
+webtalk*
+.Xil/
+
+# Cadence Xcelium
+xcelium*.d/
+cov_work/
+waves.shm/
+.simvision/
+*.history
+*.key
+*.diag
+xp_elab.log
+sim/xcelium/regress*/
+sim/xcelium/mutants/
+
+# Questa / ModelSim
+work/
+sim/work/
+transcript
+*.wlf
+*.mti
+tr_db.log
+
+# Waveforms & logs
+*.vcd
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

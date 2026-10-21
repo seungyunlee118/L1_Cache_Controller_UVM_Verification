@@ -1,0 +1,15 @@
+// ---------------------------------------------------------------------------
+// Run-time options. xrun.args pulls these in for single-step builds, and
+// regress.sh passes this file alone to every `xrun -R`, so they are written
+// down once.
+// ---------------------------------------------------------------------------
+
+// 64-bit build: the 32-bit libz is missing on the lab server (*F,RNCNL).
+-64bit
+
+// Xcelium retires a cover directive after its first finish (hit) by default,
+// so its pass action runs once and the [SVA COVER] counts would all read 1.
+-abvfinishlimit 1000000000
+
+-covoverwrite
+-nocopyright

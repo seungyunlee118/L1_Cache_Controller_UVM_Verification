@@ -219,15 +219,25 @@ interface l1_cache_if
         else uvm_report_error("SVA", "fill burst delivered the wrong number of beats");
 
     // ---- Cover -------------------------------------------------------------
+    // Each cover counts its hits in a pass action block and the counts are
+    // printed at the end, so they show up in the log on every simulator
+    // without a coverage database viewer.
+    int unsigned n_read_b2b, n_stall, n_eviction, n_partial_be;
+
     cover_read_b2b:  cover property (
-        @(posedge clk) disable iff (!rst_n) cpu_rsp_valid ##1 cpu_rsp_valid);
+        @(posedge clk) disable iff (!rst_n) cpu_rsp_valid ##1 cpu_rsp_valid) n_read_b2b++;
     cover_stall:     cover property (
-        @(posedge clk) disable iff (!rst_n) cpu_req_valid && !cpu_req_ready);
+        @(posedge clk) disable iff (!rst_n) cpu_req_valid && !cpu_req_ready) n_stall++;
     cover_eviction:  cover property (
-        @(posedge clk) disable iff (!rst_n) mem_req_valid && mem_req_rw && mem_req_ready);
+        @(posedge clk) disable iff (!rst_n) mem_req_valid && mem_req_rw && mem_req_ready) n_eviction++;
     cover_partial_be: cover property (
         @(posedge clk) disable iff (!rst_n)
-        cpu_req_valid && cpu_req_rw && cpu_req_ready && (cpu_req_be != '1));
+        cpu_req_valid && cpu_req_rw && cpu_req_ready && (cpu_req_be != '1)) n_partial_be++;
+
+    final begin
+        $display("[SVA COVER] read_b2b=%0d stall=%0d eviction=%0d partial_be=%0d",
+                 n_read_b2b, n_stall, n_eviction, n_partial_be);
+    end
 
     // ========================================================================
     // Reset helper - used by the reset agent
