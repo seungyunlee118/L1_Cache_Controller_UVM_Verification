@@ -218,7 +218,7 @@ make                                   # build + run the default test
 make TEST=l1_cache_stress_test SEED=42
 make XPROP=C                           # X-propagation build (CAT; F for FOX)
 make WAVE=1                            # SHM dump -> waves.shm
-make view                              # open it: simvision -64bit waves.shm
+make view                              # open it with the view.tcl signal layout
 make GUI=1                             # interactive SimVision
 make PLUSARGS="+NUM_TRANS=500 +SEQ=l1_cache_rand_seq"
 

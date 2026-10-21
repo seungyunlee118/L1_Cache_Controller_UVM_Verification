@@ -5,7 +5,7 @@
 #    make TEST=l1_cache_stress_test SEED=42
 #    make XPROP=C                           # X-propagation build (C or F)
 #    make WAVE=1                            # dump an SHM database -> waves.shm
-#    make view                              # open waves.shm in SimVision
+#    make view                              # open waves.shm in SimVision (view.tcl layout)
 #    make GUI=1                             # open the run in SimVision
 #    make regress                           # 11 tests x 4 seeds  (regress.sh)
 #    make regress_xprop                     # the same with -xprop C
@@ -49,9 +49,10 @@ run:
 	grep -E "^UVM_(ERROR|FATAL) .* @ " xrun.log | head -5; true
 
 # Plain `simvision` starts the 32-bit binary, which needs the 32-bit libX11 the
-# lab host does not have; -64bit picks the 64-bit one.
+# lab host does not have; -64bit picks the 64-bit one. view.tcl lays out the
+# CPU, controller and memory signals so the window does not open empty.
 view:
-	@source ./xcelium_env.sh && simvision -64bit waves.shm &
+	@source ./xcelium_env.sh && simvision -64bit waves.shm -input view.tcl &
 
 regress:
 	./regress.sh
